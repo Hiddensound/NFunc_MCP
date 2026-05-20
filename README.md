@@ -1,4 +1,6 @@
-# qa-mcp
+# nfunc-mcp
+
+[![npm](https://img.shields.io/npm/v/nfunc-mcp)](https://www.npmjs.com/package/nfunc-mcp)
 
 A local MCP server that gives Claude (or any MCP client) a full non-functional QA toolkit. Run Lighthouse, WCAG accessibility checks, and static code analysis — individually or all at once — and get back structured, prioritised findings you can act on immediately.
 
@@ -28,7 +30,7 @@ A local MCP server that gives Claude (or any MCP client) a full non-functional Q
 
 ## What it does
 
-`qa-mcp` wires four QA tools into Claude's tool-use loop:
+`nfunc-mcp` wires four QA tools into Claude's tool-use loop:
 
 | Capability | Tools | What it checks |
 |---|---|---|
@@ -45,14 +47,14 @@ The `run_qa_gate` orchestrator runs all of them in parallel, cross-correlates fi
 
 ## Prerequisites
 
-The following CLI tools must be available on your PATH:
+`nfunc-mcp` is a thin wrapper around four CLI tools. Install the ones you need before registering the server:
 
-```bash
-npm install -g lighthouse      # Lighthouse
-npm install -g pa11y           # pa11y
-npm install -g eslint          # ESLint
-brew install semgrep           # Semgrep (or pip install semgrep)
-```
+| Tool | Install | Used by |
+|---|---|---|
+| Lighthouse | `npm install -g lighthouse` | `run_lighthouse`, `run_qa_gate` (URL) |
+| pa11y | `npm install -g pa11y` | `run_accessibility_check`, `run_qa_gate` (URL) |
+| ESLint | `npm install -g eslint` | `run_static_analysis`, `run_qa_gate` (path) |
+| Semgrep | `brew install semgrep` or `pip install semgrep` | `run_static_analysis`, `run_qa_gate` (path) |
 
 Verify each is reachable:
 
@@ -63,20 +65,46 @@ eslint --version
 semgrep --version
 ```
 
-If a tool is missing, the gate still runs — that tool's scorecard entry will show `UNAVAILABLE` and its findings are omitted from the report.
+**You don't need all four.** If a tool is missing or not installed, the gate still runs — that tool's scorecard entry shows `UNAVAILABLE` and its findings are skipped. URL-only runs only need Lighthouse and pa11y; path-only runs only need ESLint and Semgrep.
 
 ---
 
-## Install & build
+## Install & register
+
+### Option A — npm (recommended, no cloning needed)
 
 ```bash
-git clone <repo-url>
-cd qa-mcp
-npm install
-npm run build
+claude mcp add nfunc-mcp -- npx -y nfunc-mcp
 ```
 
-### Scripts
+That's it. `npx` downloads and runs the server on your machine automatically. No repo clone, no build step.
+
+### Option B — Manual config (npm)
+
+Add to `~/.claude.json` under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "nfunc-mcp": {
+      "command": "npx",
+      "args": ["-y", "nfunc-mcp"]
+    }
+  }
+}
+```
+
+### Option C — From source (contributors / local dev)
+
+```bash
+git clone https://github.com/Hiddensound/NFunc_MCP.git
+cd NFunc_MCP
+npm install
+npm run build
+claude mcp add nfunc-mcp -- node /absolute/path/to/NFunc_MCP/dist/index.js
+```
+
+### Scripts (source only)
 
 | Script | Purpose |
 |---|---|
@@ -84,35 +112,10 @@ npm run build
 | `npm start` | Run the compiled server |
 | `npm run dev` | Run from source with hot reload (`tsx watch`) |
 
----
-
-## Register with Claude Code
-
-### Option A — CLI (recommended)
-
-```bash
-claude mcp add qa-mcp -- node /absolute/path/to/qa-mcp/dist/index.js
-```
-
-### Option B — Manual config
-
-Add to `~/.claude.json` under `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "qa-mcp": {
-      "command": "node",
-      "args": ["/absolute/path/to/qa-mcp/dist/index.js"]
-    }
-  }
-}
-```
-
 ### Verify the connection
 
-1. Run `/mcp` in Claude Code — `qa-mcp` should show as `connected`.
-2. Ask Claude: *"Call the qa-mcp ping tool."*
+1. Run `/mcp` in Claude Code — `nfunc-mcp` should show as `connected`.
+2. Ask Claude: *"Call the nfunc-mcp ping tool."*
 3. Expected response:
    ```json
    { "status": "ok", "timestamp": "2026-05-20T12:00:00.000Z" }
