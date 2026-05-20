@@ -1,20 +1,50 @@
 {
-  "name": "qa-mcp",
+  "name": "@hiddensound/qa-mcp",
   "version": "0.1.0",
-  "description": "Local MCP server for QA workflows",
+  "description": "MCP server for non-functional QA — Lighthouse, pa11y, ESLint, and Semgrep in parallel with cross-tool correlation and HTML reports",
   "main": "dist/index.js",
   "type": "module",
   "bin": {
     "qa-mcp": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc && mkdir -p dist/config && cp src/config/*.js dist/config/",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "prepare": "npm run build"
   },
-  "keywords": ["mcp", "qa"],
-  "author": "",
+  "keywords": [
+    "mcp",
+    "qa",
+    "quality-assurance",
+    "lighthouse",
+    "pa11y",
+    "accessibility",
+    "wcag",
+    "eslint",
+    "semgrep",
+    "performance",
+    "non-functional-testing",
+    "claude",
+    "ai-tools"
+  ],
+  "author": "Ajinkya Kunjir",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Hiddensound/NFunc_MCP.git"
+  },
+  "homepage": "https://github.com/Hiddensound/NFunc_MCP#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "execa": "^9.6.1",
