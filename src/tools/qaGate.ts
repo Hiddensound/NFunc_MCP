@@ -1,12 +1,10 @@
 import { z } from "zod";
-import { fileURLToPath } from "url";
 import { resolve } from "path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { runShell } from "../utils/shellRunner.js";
 import {
   parseLighthouseJSON,
   parsePa11yJSON,
-  parseESLintJSON,
   parseSemgrepJSON,
 } from "../utils/outputParsers.js";
 import {
@@ -15,7 +13,7 @@ import {
   formatStaticAnalysisFinding,
   type StaticAnalysisIssue,
 } from "../mappers/defectFormatter.js";
-import { detectESLintConfig } from "../utils/eslintConfigDetector.js";
+import { runESLint } from "../utils/eslintRunner.js";
 import {
   correlate,
   type ToolReports,
@@ -24,10 +22,6 @@ import {
 import type { Finding } from "../types.js";
 import type { Priority } from "../mappers/priorityMapper.js";
 import { generateHtmlReport } from "../utils/reportGenerator.js";
-
-const BASELINE_CONFIG_PATH = fileURLToPath(
-  new URL("../config/qa-mcp-baseline.eslint.config.js", import.meta.url),
-);
 
 const PRIORITY_ORDER: Record<Priority, number> = { P1: 0, P2: 1, P3: 2 };
 
@@ -121,41 +115,18 @@ async function runStatic(absPath: string): Promise<{
   findings: Finding[];
   warnings: string[];
 }> {
-  const { hasConfig } = detectESLintConfig(absPath);
-  const eslintConfigUsed = hasConfig ? "project" : "qa-mcp-baseline";
-
-  const eslintArgs = [
-    ".", "--format", "json",
-    "--ignore-pattern", "node_modules",
-    "--ignore-pattern", "dist",
-  ];
-  if (!hasConfig) eslintArgs.push("--config", BASELINE_CONFIG_PATH);
-
   const semgrepArgs = [
     "--config=p/javascript", "--config=p/typescript",
     "--json", "--exclude", "node_modules", ".",
   ];
 
-  // ESLint and Semgrep themselves run in parallel inside the static runner.
-  const [eslintResult, semgrepResult] = await Promise.all([
-    runShell("eslint", eslintArgs, { timeoutMs: 120_000, cwd: absPath }),
+  const [eslintRun, semgrepResult] = await Promise.all([
+    runESLint(absPath),
     runShell("semgrep", semgrepArgs, { timeoutMs: 180_000, cwd: absPath }),
   ]);
 
-  const allIssues: StaticAnalysisIssue[] = [];
-  const warnings: string[] = [];
-
-  if (eslintResult.exitCode === -1 && !eslintResult.stdout && !eslintResult.stderr) {
-    warnings.push("ESLint not installed — ESLint analysis skipped.");
-  } else if (eslintResult.exitCode === 2) {
-    warnings.push(`ESLint configuration error: ${eslintResult.stderr.slice(0, 200)}`);
-  } else if (eslintResult.stdout) {
-    try {
-      for (const issue of parseESLintJSON(eslintResult.stdout).issues) {
-        allIssues.push({ source: "eslint", file: issue.filePath, line: issue.line, column: issue.column, ruleId: issue.ruleId, message: issue.message, severity: issue.severity });
-      }
-    } catch { warnings.push("ESLint output could not be parsed."); }
-  }
+  const allIssues: StaticAnalysisIssue[] = [...eslintRun.issues];
+  const warnings: string[] = [...eslintRun.warnings];
 
   if (semgrepResult.exitCode === -1 && !semgrepResult.stdout && !semgrepResult.stderr) {
     warnings.push("Semgrep not installed — Semgrep analysis skipped.");
@@ -167,7 +138,7 @@ async function runStatic(absPath: string): Promise<{
     } catch { warnings.push("Semgrep output could not be parsed."); }
   }
 
-  // Deduplicate by file:line (same logic as staticAnalysis.ts).
+  // Deduplicate by file:line.
   const dedupMap = new Map<string, Finding>();
   for (const issue of allIssues) {
     const f = formatStaticAnalysisFinding(issue);
@@ -180,7 +151,7 @@ async function runStatic(absPath: string): Promise<{
   }
   const findings = Array.from(dedupMap.values());
 
-  return { issue_count: findings.length, eslint_config_used: eslintConfigUsed, findings, warnings };
+  return { issue_count: findings.length, eslint_config_used: eslintRun.config_used, findings, warnings };
 }
 
 // ---------------------------------------------------------------------------
