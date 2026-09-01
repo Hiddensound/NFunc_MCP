@@ -105,6 +105,8 @@ export function parseLighthouseJSON(rawJson: string): ParsedLighthouse {
 }
 
 export type WcagLevel = "A" | "AA" | "AAA" | "unknown";
+export type A11yRunner = "htmlcs" | "axe";
+export type AxeImpact = "critical" | "serious" | "moderate" | "minor";
 
 export interface Pa11yViolation {
   code: string;
@@ -115,6 +117,18 @@ export interface Pa11yViolation {
   type: "error" | "warning" | "notice";
   wcagLevel: WcagLevel;
   criterion: string | null;
+  /**
+   * Which engine produced this. The two emit completely different `code`
+   * shapes — htmlcs gives WCAG technique paths
+   * ("WCAG2AA.Principle1.Guideline1_1.1_1_1.H37"), axe gives bare rule ids
+   * ("image-alt") — so every consumer has to branch on this rather than
+   * pattern-matching the code.
+   */
+  runner: A11yRunner;
+  /** axe only: axe's own severity rating, its equivalent of Lighthouse weight. */
+  impact?: AxeImpact;
+  /** axe only: the rule could not decide alone and wants human confirmation. */
+  needsReview?: boolean;
 }
 
 export interface ParsedPa11y {
@@ -128,6 +142,13 @@ interface RawPa11yIssue {
   message?: string;
   context?: string;
   selector?: string;
+  runner?: string;
+  runnerExtras?: {
+    impact?: string;
+    needsFurtherReview?: boolean;
+    help?: string;
+    description?: string;
+  };
 }
 
 const WCAG_CRITERION_LEVELS: Record<string, WcagLevel> = {
@@ -205,6 +226,10 @@ function deriveWcagLevel(code: string): {
   if (prefix === "WCAG2AA") return { level: "AA", criterion };
   if (prefix === "WCAG2A") return { level: "A", criterion };
   return { level: "unknown", criterion };
+}
+
+function isAxeImpact(v: string | undefined): v is AxeImpact {
+  return v === "critical" || v === "serious" || v === "moderate" || v === "minor";
 }
 
 function extractTechnique(code: string): string {
@@ -322,6 +347,31 @@ export function parsePa11yJSON(rawJson: string): ParsedPa11y {
   for (const issue of issues) {
     const code = issue.code ?? "";
     const type = (issue.type ?? "error") as Pa11yViolation["type"];
+    const runner: A11yRunner = issue.runner === "axe" ? "axe" : "htmlcs";
+
+    if (runner === "axe") {
+      // axe codes are bare rule ids with no WCAG path to parse, so the
+      // criterion-derivation below cannot classify them — it would return
+      // level "unknown", which the priority mapper drops. Severity comes from
+      // axe's own impact rating instead. (Skipping this branch silently
+      // discarded every axe finding.)
+      const impact = issue.runnerExtras?.impact;
+      violations.push({
+        code,
+        technique: code,
+        message: issue.message ?? "",
+        selector: issue.selector ?? "",
+        context: issue.context ?? "",
+        type,
+        wcagLevel: "unknown",
+        criterion: null,
+        runner,
+        impact: isAxeImpact(impact) ? impact : undefined,
+        needsReview: issue.runnerExtras?.needsFurtherReview === true,
+      });
+      continue;
+    }
+
     const { level, criterion } = deriveWcagLevel(code);
     violations.push({
       code,
@@ -332,6 +382,7 @@ export function parsePa11yJSON(rawJson: string): ParsedPa11y {
       type,
       wcagLevel: level,
       criterion,
+      runner,
     });
   }
 

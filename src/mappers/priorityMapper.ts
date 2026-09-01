@@ -115,6 +115,32 @@ const TECHNIQUE_PRIORITY: Record<string, Priority> = {
   G14: "P3", // meaning conveyed by colour alone
 };
 
+/**
+ * Priority for an axe finding, from axe's own impact rating.
+ *
+ * Same principle as using Lighthouse's audit weight: the tool has already
+ * graded severity, so grade with it rather than inventing a parallel scheme.
+ * axe's ladder is critical > serious > moderate > minor.
+ *
+ * `needsFurtherReview` marks a rule that could not decide on its own and wants
+ * a human to confirm. Those are demoted one tier — a maybe should not gate a
+ * release with the same force as a definite.
+ */
+export function axeImpactToPriority(
+  impact: string | undefined,
+  needsReview: boolean | undefined,
+): Priority | null {
+  const base: Priority =
+    impact === "critical" ? "P1"
+    : impact === "serious" ? "P2"
+    : impact === "moderate" ? "P3"
+    : impact === "minor" ? "P3"
+    : "P3"; // unrated: report, never block
+
+  if (!needsReview) return base;
+  return base === "P1" ? "P2" : "P3";
+}
+
 export function a11yTechniqueToPriority(
   technique: string,
   wcagLevel: string,

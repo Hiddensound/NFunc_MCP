@@ -5,6 +5,7 @@ import type {
 import {
   lighthouseImpactToPriority,
   a11yTechniqueToPriority,
+  axeImpactToPriority,
   staticAnalysisToPriority,
 } from "./priorityMapper.js";
 import type { Finding } from "../types.js";
@@ -140,6 +141,17 @@ const QA_DESCRIPTIONS: Record<string, Templater> = {
   // --- Accessibility (Lighthouse-side) ---
   "aria-prohibited-attr": () =>
     `An element carries an ARIA attribute that its role does not permit; assistive tech either ignores the attribute or announces the element incorrectly.`,
+  // Shared with the axe runner, whose rule ids match Lighthouse audit ids.
+  "aria-allowed-attr": () =>
+    `An element uses an ARIA attribute its role does not support; the attribute is ignored, so the state it was meant to convey — pressed, expanded, selected — never reaches screen-reader users.`,
+  "aria-required-children": () =>
+    `An ARIA role that requires specific child roles is missing them; assistive tech cannot interpret the widget and may skip or misannounce its contents.`,
+  "aria-required-parent": () =>
+    `An element with a child ARIA role sits outside the parent role it requires; screen readers lose the relationship and announce the item without its surrounding context.`,
+  "aria-valid-attr-value": () =>
+    `An ARIA attribute holds an invalid value, often an id reference pointing at an element that does not exist; the name or relationship it was meant to establish silently fails.`,
+  "duplicate-id-aria": () =>
+    `An id used by an ARIA reference appears more than once; the reference resolves to the wrong element, so labels and relationships attach to the wrong control.`,
   "aria-dialog-name": () =>
     `A dialog or alertdialog has no accessible name; screen-reader users are moved into a modal with no indication of what it is asking them to do.`,
   "heading-order": () =>
@@ -438,8 +450,44 @@ export function formatStaticAnalysisFinding(
   };
 }
 
+/**
+ * axe rule ids are the same identifiers Lighthouse uses for its accessibility
+ * audits — Lighthouse runs axe internally — so an axe finding can borrow the
+ * QA prose already written for the matching Lighthouse audit instead of
+ * duplicating it. Falls back to axe's own help text, stripped of the trailing
+ * documentation URL that would otherwise land in a defect ticket.
+ */
+function axeDescription(violation: Pa11yViolation): string {
+  const shared = QA_DESCRIPTIONS[violation.code];
+  if (shared) {
+    return shared({ id: violation.code, displayValue: "" } as LighthouseAuditRef);
+  }
+  const cleaned = violation.message.replace(/\s*\(https?:\/\/[^)]*\)\s*$/, "").trim();
+  return cleaned
+    ? `${cleaned}. Flagged by axe as ${violation.impact ?? "unrated"} impact; assistive-tech users are likely affected.`
+    : `axe rule "${violation.code}" failed; assistive-tech users are likely affected.`;
+}
+
 export function formatA11yFinding(violation: Pa11yViolation): Finding | null {
   if (violation.type === "notice") return null;
+
+  if (violation.runner === "axe") {
+    const priority = axeImpactToPriority(violation.impact, violation.needsReview);
+    if (!priority) return null;
+    return {
+      priority,
+      title: violation.message.replace(/\s*\(https?:\/\/[^)]*\)\s*$/, "").trim() || violation.code,
+      description: axeDescription(violation),
+      evidence: {
+        rule_code: violation.code,
+        selector: violation.selector,
+        runner: "axe",
+        ...(violation.impact ? { axe_impact: violation.impact } : {}),
+        ...(violation.needsReview ? { needs_manual_review: true } : {}),
+      },
+    };
+  }
+
   const priority = a11yTechniqueToPriority(
     violation.technique,
     violation.wcagLevel,
