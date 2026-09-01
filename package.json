@@ -1,6 +1,6 @@
 {
   "name": "nfunc-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for non-functional QA — Lighthouse, pa11y, ESLint, and Semgrep in parallel with cross-tool correlation and HTML reports",
   "main": "dist/index.js",
   "type": "module",
