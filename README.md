@@ -22,6 +22,8 @@ A local MCP server that gives Claude (or any MCP client) a full non-functional Q
    - [HTML report](#html-report)
    - [Output shape](#output-shape)
 7. [Individual tools](#individual-tools)
+   - [Mobile vs desktop](#mobile-vs-desktop)
+   - [Choosing an accessibility engine](#choosing-an-accessibility-engine)
 8. [Priority system](#priority-system)
 9. [Project layout](#project-layout)
 10. [How to prompt](#how-to-prompt)
@@ -128,10 +130,10 @@ claude mcp add nfunc-mcp -- node /absolute/path/to/NFunc_MCP/dist/index.js
 | Tool | Description | Inputs |
 |---|---|---|
 | `ping` | Health check — confirms the server is up | — |
-| `run_lighthouse` | Full Lighthouse audit for a URL | `url` |
-| `run_accessibility_check` | pa11y WCAG audit for a URL | `url`, `standard` (optional), `ignore` (optional) |
+| `run_lighthouse` | Full Lighthouse audit for a URL | `url`, `form_factor` (optional), `categories` (optional), `thresholds` (optional) |
+| `run_accessibility_check` | pa11y WCAG audit for a URL | `url`, `runner` (optional), `standard` (optional), `ignore` (optional) |
 | `run_static_analysis` | ESLint + Semgrep scan for a local codebase | `path` |
-| `run_qa_gate` | All tools in parallel + correlation + HTML report | `url` and/or `path` |
+| `run_qa_gate` | All tools in parallel + correlation + HTML report | `url` and/or `path`, `form_factor` (optional), `a11y_runner` (optional) |
 
 ---
 
@@ -148,6 +150,8 @@ Both inputs are **optional** — provide whichever you have. At least one is req
 | `url` | string (URL) | You have a running page — production, staging, preview URL, or localhost. Enables Lighthouse and pa11y. |
 | `path` | string (path) | You have a local codebase. Enables ESLint and Semgrep. |
 | `context` | string | Optional. Free-text description of the project (e.g. `"React e-commerce checkout"`). Helps Claude interpret results. |
+| `form_factor` | `mobile` \| `desktop` \| `both` | Optional, default `mobile`. Lighthouse device profile — see [Mobile vs desktop](#mobile-vs-desktop). |
+| `a11y_runner` | `htmlcs` \| `axe` \| `both` | Optional, default `htmlcs`. pa11y engine — see [Choosing an accessibility engine](#choosing-an-accessibility-engine). |
 
 **URL only** — browser-based checks, static analysis skipped:
 ```
@@ -300,9 +304,28 @@ Runs a full Lighthouse audit against a URL.
 
 ```
 Run Lighthouse on https://myapp.com
+Run Lighthouse on https://myapp.com for mobile and desktop
 ```
 
-Returns: `url`, `scores` (per category), `ttfb_ms`, `findings` (priority-ordered).
+Returns: `url`, `form_factor`, `scores` (per category), `ttfb_ms`, `findings` (priority-ordered).
+
+#### Mobile vs desktop
+
+`form_factor` accepts `desktop` (default), `mobile`, or `both`.
+
+**This default deliberately differs from the Lighthouse CLI's**, which is mobile: a 412×823 screen, a mid-range Android user agent, simulated slow 4G, and a **4× CPU slowdown**. That profile is much harsher and reports substantially lower performance scores for the same page, so passing `mobile` here is not a like-for-like comparison with a default run — check `form_factor` in the response before comparing two reports.
+
+**The two are not interchangeable.** They render different DOM, so they find different defects — not just different performance numbers. Measured against one commerce category page:
+
+| | Mobile | Desktop |
+|---|---|---|
+| performance | 54 | 62 |
+| accessibility | **87** | **73** |
+| seo | 77 | 69 |
+
+Five accessibility audits failed on desktop that mobile never reported — `image-alt`, `aria-required-children`, `aria-required-parent`, `aria-allowed-attr`, `aria-valid-attr-value` — while three others failed only on mobile. Neither profile is a superset of the other.
+
+With `form_factor: "both"`, the two run concurrently (so it costs little more wall time than one), `scores` is keyed by form factor, and each finding carries `affects_form_factors` and `form_factor_specific` so device-only regressions are obvious at a glance.
 
 ### run_accessibility_check
 
@@ -311,9 +334,28 @@ Runs pa11y against a URL at WCAG 2 AA by default. Returns only violations (error
 ```
 Run an accessibility check on https://myapp.com
 Run accessibility check at AAA standard on https://myapp.com
+Run an accessibility check on https://myapp.com using the axe runner
 ```
 
-Returns: `url`, `standard`, `violation_count`, `findings`.
+Returns: `url`, `standard`, `runners`, `violation_count`, `raw_violation_count`, `findings`.
+
+#### Choosing an accessibility engine
+
+`runner` accepts `htmlcs` (default), `axe`, or `both`.
+
+| Engine | Strongest at | Severity source |
+|---|---|---|
+| `htmlcs` | WCAG techniques, document structure, form labelling, duplicate ids | WCAG technique class |
+| `axe` | **ARIA** — invalid roles, missing required parent/child relationships, prohibited and unsupported attributes — and computed colour contrast | axe's own `impact` rating |
+
+**Reach for `axe` whenever the work under test involves ARIA, a component library, or a design system.** The overlap between the engines is smaller than you would expect. On the same page:
+
+- htmlcs found unlabelled inputs, forms with no submit mechanism, and ten duplicate ids that axe did not report.
+- axe found `aria-allowed-attr`, `aria-prohibited-attr`, `aria-required-parent`, `aria-required-children` and `image-alt` failures that htmlcs missed entirely.
+
+`both` runs them concurrently and merges the results. Note that an element flagged by both engines appears twice, because they emit different rule codes for the same defect — that is deliberate, since two independent engines agreeing is corroboration worth seeing.
+
+Findings from axe carry `axe_impact` in evidence, and `needs_manual_review: true` where axe wants a human to confirm (those are demoted one priority tier — a maybe should not gate a release as hard as a certainty).
 
 ### run_static_analysis
 

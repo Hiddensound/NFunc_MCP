@@ -40,17 +40,56 @@ function promotePriority(p: Priority): Priority {
 // Maps Lighthouse accessibility audit IDs to substrings that appear inside the
 // pa11y rule_code for the same class of issue.  A leading "." prevents matching
 // partial segment names (e.g. ".H44" won't accidentally match ".1H44").
+//
+// Keep this keyed on defects the two tools genuinely detect in common. A wrong
+// entry is worse than a missing one: a bogus match promotes a finding a whole
+// priority tier and stamps it "confirmed by two tools". Where Lighthouse and
+// pa11y test adjacent-but-different criteria (e.g. label-content-name-mismatch
+// under WCAG 2.5.3 vs F68 under 1.3.1) they are deliberately left unmapped.
 const LH_TO_PA11Y_SUBSTRINGS: Record<string, string[]> = {
+  // Colour / contrast
   "color-contrast": [".G18", ".G145", ".G174"],
+
+  // Images
   "image-alt": [".H37", ".H67", ".F65"],
+  "input-image-alt": [".H36"],
+  "object-alt": [".H53"],
+
+  // Accessible names on controls
   label: [".H44", ".F68", ".H91.Input", ".H91.Select", ".H91.Textarea"],
-  "link-name": [".H30", ".H91.A."],
-  "document-title": [".H25", ".F89"],
-  "html-has-lang": [".H57"],
-  "frame-title": [".H64"],
+  "form-field-multiple-labels": [".H44", ".F68"],
   "button-name": [".H91.Button"],
   "select-name": [".H91.Select"],
+  "aria-input-field-name": [".ARIA6", ".ARIA9", ".H91"],
+  "aria-toggle-field-name": [".ARIA6", ".ARIA9", ".H91"],
+  "aria-command-name": [".ARIA6", ".ARIA9", ".H91"],
+  "aria-dialog-name": [".ARIA6", ".ARIA9"],
+
+  // ARIA misuse
+  "aria-prohibited-attr": [".ARIA6", ".ARIA4"],
+  "aria-valid-attr-value": [".ARIA9"],
+
+  // Links
+  "link-name": [".H30", ".H91.A."],
+  "link-text": [".H30", ".H91.A."],
+  "crawlable-anchors": [".G1,G123,G124", ".H30"],
+
+  // Document / language
+  "document-title": [".H25", ".F89"],
+  "html-has-lang": [".H57"],
+  "html-lang-valid": [".H57"],
+  "valid-lang": [".H58"],
+
+  // Structure
+  "heading-order": [".G141", ".H42"],
+  "frame-title": [".H64"],
+
+  // Duplicate identifiers. Lighthouse 12 removed duplicate-id-aria altogether,
+  // which is why a page throwing 35 pa11y F77 violations correlated with
+  // nothing under Lighthouse 13. Both ids are kept so older Lighthouse output
+  // still matches; there is currently no LH 13 equivalent to pair F77 with.
   "duplicate-id-aria": [".H93", ".F77"],
+  "duplicate-id-active": [".H93", ".F77"],
 };
 
 // Lighthouse performance audit IDs where Rule 2 (code linkage) is relevant.
@@ -63,13 +102,27 @@ const PERFORMANCE_AUDIT_IDS = new Set([
   "total-blocking-time",
 ]);
 
+// Deterministic non-crypto string hash (djb2), base36-encoded.
+// Selectors are long and routinely share long prefixes — e.g.
+// "#accordion-panel-:rn: > div > div > input:nth-child(1)" and the same
+// selector ending ":nth-child(3)" are identical for their first 40 characters.
+// The previous id truncated the selector to 16 chars, so those two distinct
+// findings collapsed to one id and consumedA11yIds claimed the wrong entry
+// during correlation. Hashing the whole selector keeps ids short and unique.
+function shortHash(input: string): string {
+  let h = 5381;
+  for (let i = 0; i < input.length; i++) {
+    h = ((h << 5) + h + input.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(36);
+}
+
 function makeId(tool: string, f: Finding): string {
   const e = f.evidence;
   if (tool === "lighthouse") return `lh:${String(e["audit_id"] ?? f.title)}`;
   if (tool === "a11y") {
     const code = String(e["rule_code"] ?? "").split(".").slice(-2).join(".");
-    const sel = String(e["selector"] ?? "").slice(0, 16);
-    return `a11y:${code}:${sel}`;
+    return `a11y:${code}:${shortHash(String(e["selector"] ?? ""))}`;
   }
   const basename = String(e["file"] ?? "").split("/").pop() ?? "";
   return `static:${String(e["source"] ?? "")}:${basename}:${String(e["line"] ?? "")}`;
@@ -100,40 +153,61 @@ function applyRule1(
     const substrings = LH_TO_PA11Y_SUBSTRINGS[auditId];
     if (!substrings) continue;
 
-    for (const a11yF of a11yFindings) {
-      if (consumedA11yIds.has(a11yF.id)) continue;
+    // Claim every unconsumed pa11y finding covering the same technique, not
+    // just the first. One Lighthouse audit routinely corresponds to several
+    // pa11y violations — one per offending element — and stopping at the first
+    // left the rest to reappear as uncorroborated copies of the same defect.
+    const matches = a11yFindings.filter((a11yF) => {
+      if (consumedA11yIds.has(a11yF.id)) return false;
       const ruleCode = String(a11yF.evidence["rule_code"] ?? "");
-      if (!substrings.some((s) => ruleCode.includes(s))) continue;
+      return substrings.some((s) => ruleCode.includes(s));
+    });
+    if (matches.length === 0) continue;
 
-      // Use the better (lower index = higher priority) of the two raw priorities
-      // as the base, then promote it one tier.
-      const basePriority =
-        PRIORITY_ORDER[lhF.priority] <= PRIORITY_ORDER[a11yF.priority]
-          ? lhF.priority
-          : a11yF.priority;
+    // Use the most severe of the matched pa11y findings, then take the better
+    // (lower index = higher priority) of that and the Lighthouse finding as the
+    // base, and promote it one tier.
+    const worstA11y = matches.reduce((a, b) =>
+      PRIORITY_ORDER[a.priority] <= PRIORITY_ORDER[b.priority] ? a : b,
+    );
+    const basePriority =
+      PRIORITY_ORDER[lhF.priority] <= PRIORITY_ORDER[worstA11y.priority]
+        ? lhF.priority
+        : worstA11y.priority;
 
-      correlated.push({
-        id: `corr:lh+a11y:${auditId}`,
-        source_tool: "lighthouse+pa11y",
-        priority: promotePriority(basePriority),
-        title: lhF.title,
-        description:
-          `[Lighthouse] ${lhF.description} ` +
-          `[pa11y] ${a11yF.description} ` +
-          `Two independent tools flagged the same accessibility gap — ` +
-          `this cross-tool confirmation increases confidence that the issue is real and affects real users.`,
-        evidence: {
-          ...lhF.evidence,
-          pa11y_rule_code: ruleCode,
-          pa11y_selector: a11yF.evidence["selector"] ?? "",
-        },
-        confirmed_by: ["lighthouse", "pa11y"],
-      });
+    // Findings arrive here already deduplicated, so fold the collapsed
+    // occurrence counts back in to report how many elements are affected.
+    const elementCount = matches.reduce(
+      (n, m) => n + Number(m.evidence["occurrences"] ?? 1),
+      0,
+    );
 
-      consumedLhIds.add(lhF.id);
-      consumedA11yIds.add(a11yF.id);
-      break; // one correlation per Lighthouse finding
-    }
+    correlated.push({
+      id: `corr:lh+a11y:${auditId}`,
+      source_tool: "lighthouse+pa11y",
+      priority: promotePriority(basePriority),
+      title: lhF.title,
+      description:
+        `[Lighthouse] ${lhF.description} ` +
+        `[pa11y] ${worstA11y.description} ` +
+        `Two independent tools flagged the same accessibility gap across ` +
+        `${elementCount} element${elementCount !== 1 ? "s" : ""} — ` +
+        `this cross-tool confirmation increases confidence that the issue is real and affects real users.`,
+      evidence: {
+        ...lhF.evidence,
+        pa11y_rule_codes: [
+          ...new Set(matches.map((m) => String(m.evidence["rule_code"] ?? ""))),
+        ],
+        pa11y_selectors: matches
+          .slice(0, 5)
+          .map((m) => String(m.evidence["selector"] ?? "")),
+        pa11y_elements_affected: elementCount,
+      },
+      confirmed_by: ["lighthouse", "pa11y"],
+    });
+
+    consumedLhIds.add(lhF.id);
+    for (const m of matches) consumedA11yIds.add(m.id);
   }
 
   return { correlated, consumedLhIds, consumedA11yIds };

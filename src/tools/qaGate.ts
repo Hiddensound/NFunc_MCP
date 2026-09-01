@@ -13,6 +13,15 @@ import {
   formatStaticAnalysisFinding,
   type StaticAnalysisIssue,
 } from "../mappers/defectFormatter.js";
+import { dedupeA11yFindings } from "../mappers/a11yDedupe.js";
+import {
+  lighthouseSubScore,
+  a11ySubScore,
+  staticSubScore,
+  compositeScore,
+  type SubScores,
+} from "../mappers/compositeScore.js";
+import { formFactorArgs, type FormFactor } from "./lighthouse.js";
 import { runESLint } from "../utils/eslintRunner.js";
 import {
   correlate,
@@ -34,6 +43,9 @@ interface ScorecardEntry {
   score?: number;
   breakdown?: Record<string, number>;
   issues?: number;
+  // pa11y only: raw occurrence count before (rule_code, selector) dedup.
+  // Present only when dedup actually collapsed something.
+  raw_issues?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -42,7 +54,10 @@ interface ScorecardEntry {
 // doesn't prevent the other two from contributing findings.
 // ---------------------------------------------------------------------------
 
-async function runLighthouse(url: string): Promise<{
+async function runLighthouse(
+  url: string,
+  formFactor: FormFactor,
+): Promise<{
   scores: Record<string, number>;
   ttfb_ms: number | null;
   findings: Finding[];
@@ -50,8 +65,14 @@ async function runLighthouse(url: string): Promise<{
 }> {
   const result = await runShell(
     "lighthouse",
-    [url, "--output=json", "--quiet", "--chrome-flags=--headless"],
-    { timeoutMs: 120_000 },
+    [
+      url,
+      "--output=json",
+      "--quiet",
+      "--chrome-flags=--headless",
+      ...formFactorArgs(formFactor),
+    ],
+    { timeoutMs: 180_000 },
   );
   if (result.exitCode === -1 && !result.stdout && !result.stderr) {
     return { scores: {}, ttfb_ms: null, findings: [], error: "Lighthouse is not installed or not found in PATH." };
@@ -75,32 +96,49 @@ async function runLighthouse(url: string): Promise<{
   }
 }
 
-async function runA11y(url: string): Promise<{
+async function runA11y(
+  url: string,
+  engines: Array<"htmlcs" | "axe">,
+): Promise<{
   violation_count: number;
+  raw_violation_count?: number;
   findings: Finding[];
   error?: string;
 }> {
-  const result = await runShell(
-    "pa11y",
-    [url, "--reporter", "json", "--standard", "WCAG2AA"],
-    { timeoutMs: 120_000 },
+  const results = await Promise.all(
+    engines.map((e) =>
+      runShell(
+        "pa11y",
+        [url, "--reporter", "json", "--standard", "WCAG2AA", "--runner", e],
+        { timeoutMs: 120_000 },
+      ),
+    ),
   );
-  if (result.exitCode === -1 && !result.stdout && !result.stderr) {
+
+  if (results.every((r) => r.exitCode === -1 && !r.stdout && !r.stderr)) {
     return { violation_count: 0, findings: [], error: "pa11y is not installed or not found in PATH." };
   }
   // pa11y exits 2 when violations are found — that is a successful run.
-  const ranOk = result.exitCode === 0 || result.exitCode === 2;
-  if (!ranOk || !result.stdout) {
-    return { violation_count: 0, findings: [], error: `pa11y failed (exit ${result.exitCode}): ${result.stderr.slice(0, 300)}` };
+  const usable = results.filter(
+    (r) => (r.exitCode === 0 || r.exitCode === 2) && r.stdout,
+  );
+  if (usable.length === 0) {
+    const r = results[0]!;
+    return { violation_count: 0, findings: [], error: `pa11y failed (exit ${r.exitCode}): ${r.stderr.slice(0, 300)}` };
   }
+
   try {
-    const parsed = parsePa11yJSON(result.stdout);
-    const findings: Finding[] = [];
-    for (const v of parsed.violations) {
-      const f = formatA11yFinding(v);
-      if (f) findings.push(f);
+    const rawFindings: Finding[] = [];
+    for (const result of usable) {
+      for (const v of parsePa11yJSON(result.stdout).violations) {
+        const f = formatA11yFinding(v);
+        if (f) rawFindings.push(f);
+      }
     }
-    return { violation_count: findings.length, findings };
+    // Dedup before the findings reach the correlator and the composite score —
+    // 35 copies of one defect otherwise floor the score and swamp all_findings.
+    const { findings, rawCount } = dedupeA11yFindings(rawFindings);
+    return { violation_count: findings.length, raw_violation_count: rawCount, findings };
   } catch (err) {
     return {
       violation_count: 0, findings: [],
@@ -166,15 +204,19 @@ function buildVerdict(findings: CorrelatedFinding[]): ReleaseReadiness {
   return "CLEAR";
 }
 
-// Option 5: severity-weighted composite score (100 = perfect health)
-function buildCompositeScore(findings: CorrelatedFinding[]): number {
-  let score = 100;
-  for (const f of findings) {
-    if (f.priority === "P1") score -= 15;
-    else if (f.priority === "P2") score -= 7;
-    else score -= 3;
-  }
-  return Math.max(0, score);
+// Composite score. See src/mappers/compositeScore.ts for why this is a
+// weighted mean of per-tool sub-scores rather than one global subtraction.
+function buildSubScores(
+  lhData: { scores: Record<string, number>; error?: string } | null,
+  a11yData: { findings: Finding[]; error?: string } | null,
+  staticData: { findings: Finding[] } | null,
+): SubScores {
+  return {
+    lighthouse:
+      lhData && !lhData.error ? lighthouseSubScore(lhData.scores) : null,
+    pa11y: a11yData && !a11yData.error ? a11ySubScore(a11yData.findings) : null,
+    static: staticData ? staticSubScore(staticData.findings) : null,
+  };
 }
 
 // Option 3: compact per-tool scorecard
@@ -183,7 +225,12 @@ function buildCompositeScore(findings: CorrelatedFinding[]): number {
 // UNAVAILABLE is reserved for tools that were attempted but failed or are not installed.
 function buildScorecard(
   lhData: { scores: Record<string, number>; error?: string } | null,
-  a11yData: { violation_count: number; findings: Finding[]; error?: string } | null,
+  a11yData: {
+    violation_count: number;
+    raw_violation_count?: number;
+    findings: Finding[];
+    error?: string;
+  } | null,
   staticData: { issue_count: number; findings: Finding[] } | null,
 ): ScorecardEntry[] {
   const entries: ScorecardEntry[] = [];
@@ -212,10 +259,14 @@ function buildScorecard(
   } else {
     const hasP1 = a11yData.findings.some((f) => f.priority === "P1");
     const hasP2 = a11yData.findings.some((f) => f.priority === "P2");
+    const raw = a11yData.raw_violation_count;
     entries.push({
       tool: "pa11y",
       gate: hasP1 ? "FAIL" : hasP2 ? "WARN" : "PASS",
       issues: a11yData.violation_count,
+      ...(raw !== undefined && raw > a11yData.violation_count
+        ? { raw_issues: raw }
+        : {}),
     });
   }
 
@@ -299,6 +350,25 @@ const inputShape = {
       "Optional free-text context about the project (e.g. 'React SPA', 'checkout flow', " +
       "'marketing site'). Pass anything the user mentions about what the app is or does.",
     ),
+  form_factor: z
+    .enum(["mobile", "desktop", "both"])
+    .optional()
+    .describe(
+      "Lighthouse device profile: 'desktop' (default, unthrottled), 'mobile' " +
+      "(throttled slow 4G with a 4x CPU slowdown, which scores far lower for " +
+      "the same page), or 'both'. The profiles render different DOM and find " +
+      "different accessibility and SEO defects, so 'both' is the thorough " +
+      "choice; it runs concurrently and costs little extra wall time.",
+    ),
+  a11y_runner: z
+    .enum(["htmlcs", "axe", "both"])
+    .optional()
+    .describe(
+      "pa11y engine: 'htmlcs' (default) for WCAG techniques, structure, " +
+      "labels and forms; 'axe' for materially better ARIA and computed " +
+      "contrast coverage; 'both' to merge them. Choose 'axe' or 'both' when " +
+      "the code under test involves ARIA or a component library.",
+    ),
 };
 
 export function registerQaGateTool(server: McpServer): void {
@@ -329,7 +399,7 @@ export function registerQaGateTool(server: McpServer): void {
         "it never fails completely.",
       inputSchema: inputShape,
     },
-    async ({ url, path: targetPath }) => {
+    async ({ url, path: targetPath, form_factor, a11y_runner }) => {
       if (!url && !targetPath) {
         return {
           content: [{ type: "text" as const, text: JSON.stringify({
@@ -340,13 +410,65 @@ export function registerQaGateTool(server: McpServer): void {
         };
       }
 
+      const requestedFF = form_factor ?? "desktop";
+      const factors: FormFactor[] =
+        requestedFF === "both" ? ["mobile", "desktop"] : [requestedFF];
+      const requestedRunner = a11y_runner ?? "htmlcs";
+      const engines: Array<"htmlcs" | "axe"> =
+        requestedRunner === "both" ? ["htmlcs", "axe"] : [requestedRunner];
+
       // Only run the tools we have inputs for. null means deliberately skipped,
       // not a failure — the scorecard will show SKIPPED for those entries.
-      const [lhData, a11yData, staticData] = await Promise.all([
-        url ? runLighthouse(url) : null,
-        url ? runA11y(url) : null,
+      // Every leg — including each Lighthouse form factor — runs concurrently.
+      const [lhRuns, a11yData, staticData] = await Promise.all([
+        url
+          ? Promise.all(
+              factors.map(async (ff) => ({ ff, data: await runLighthouse(url, ff) })),
+            )
+          : null,
+        url ? runA11y(url, engines) : null,
         targetPath ? runStatic(resolve(targetPath)) : null,
       ]);
+
+      // Collapse the form factors into one Lighthouse view for the rest of the
+      // report. Findings are merged on audit_id and tagged with the form
+      // factors they affect; scores keep the worst per category, since a page
+      // is only as healthy as its weaker profile.
+      const lhOk = lhRuns?.filter((r) => !r.data.error) ?? [];
+      const lhData: {
+        scores: Record<string, number>;
+        ttfb_ms: number | null;
+        findings: Finding[];
+        error?: string;
+      } | null = !lhRuns
+        ? null
+        : lhOk.length === 0
+          ? lhRuns[0]!.data
+          : (() => {
+              const scores: Record<string, number> = {};
+              for (const { data } of lhOk) {
+                for (const [k, v] of Object.entries(data.scores)) {
+                  scores[k] = k in scores ? Math.min(scores[k]!, v) : v;
+                }
+              }
+              const merged = new Map<string, Finding & { _ff: FormFactor[] }>();
+              for (const { ff, data } of lhOk) {
+                for (const f of data.findings) {
+                  const key = String(f.evidence["audit_id"]);
+                  const hit = merged.get(key);
+                  if (hit) hit._ff.push(ff);
+                  else merged.set(key, { ...f, _ff: [ff] });
+                }
+              }
+              const findings = Array.from(merged.values()).map(({ _ff, ...f }) => ({
+                ...f,
+                evidence:
+                  factors.length > 1
+                    ? { ...f.evidence, affects_form_factors: _ff, form_factor_specific: _ff.length === 1 }
+                    : f.evidence,
+              }));
+              return { scores, ttfb_ms: lhOk[0]!.data.ttfb_ms, findings };
+            })();
 
       // Surface tool errors but don't abort — partial reports are still useful.
       const errors: string[] = [];
@@ -393,13 +515,17 @@ export function registerQaGateTool(server: McpServer): void {
       ];
 
       const readiness = buildVerdict(allFindings);
-      const compositeScore = buildCompositeScore(allFindings);
+      const subScores = buildSubScores(lhData, a11yData, staticData);
+      const composite = compositeScore(subScores);
       const scorecard = buildScorecard(lhData, a11yData, staticData);
       const summary = buildSummary(allFindings, toolsRan, readiness, correlations_count);
 
       const report: Record<string, unknown> = {
         release_readiness: readiness,
-        composite_score: compositeScore,
+        composite_score: composite,
+        // Per-tool 0–100 health, so a low composite is attributable rather than
+        // just low. Null means the tool did not run or did not produce a score.
+        sub_scores: subScores,
         scorecard,
         ...(staticData ? { eslint_config_used: staticData.eslint_config_used } : {}),
         summary,
@@ -416,7 +542,7 @@ export function registerQaGateTool(server: McpServer): void {
           url,
           path: targetPath,
           release_readiness: readiness,
-          composite_score: compositeScore,
+          composite_score: composite ?? 0,
           scorecard,
           summary,
           corroborated_findings: corroboratedFindings as unknown as Array<Record<string, unknown>>,

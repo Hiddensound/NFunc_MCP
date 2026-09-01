@@ -3,39 +3,67 @@ import type {
   Pa11yViolation,
 } from "../utils/outputParsers.js";
 import {
-  lighthouseScoreToPriority,
-  wcagLevelToPriority,
+  lighthouseImpactToPriority,
+  a11yTechniqueToPriority,
+  axeImpactToPriority,
   staticAnalysisToPriority,
 } from "./priorityMapper.js";
 import type { Finding } from "../types.js";
 
 type Templater = (a: LighthouseAuditRef) => string;
 
+/**
+ * Parenthesised measurement, or nothing at all.
+ *
+ * displayValue is absent on binary audits and comes and goes across Lighthouse
+ * versions, so interpolating it directly left "()" or a doubled space stranded
+ * mid-sentence. Every template that appends a measurement goes through this;
+ * templates that build a sentence *around* the value guard it explicitly and
+ * supply alternative phrasing instead.
+ */
+const paren = (v: string | undefined): string => (v ? ` (${v})` : "");
+
 const QA_DESCRIPTIONS: Record<string, Templater> = {
   "first-contentful-paint": (a) =>
-    `Users see the first piece of content ${a.displayValue} after navigation, which is slower than the recommended threshold for a smooth perceived load.`,
+    a.displayValue
+      ? `Users see the first piece of content ${a.displayValue} after navigation, which is slower than the recommended threshold for a smooth perceived load.`
+      : `Users see the first piece of content later after navigation than the recommended threshold for a smooth perceived load.`,
   "largest-contentful-paint": (a) =>
-    `Users see the main page content ${a.displayValue} after navigation, above the recommended threshold for a responsive feel.`,
+    a.displayValue
+      ? `Users see the main page content ${a.displayValue} after navigation, above the recommended threshold for a responsive feel.`
+      : `Users see the main page content later after navigation than the recommended threshold for a responsive feel.`,
   "speed-index": (a) =>
-    `The page takes ${a.displayValue} to visually populate, which feels sluggish to users on first load.`,
+    a.displayValue
+      ? `The page takes ${a.displayValue} to visually populate, which feels sluggish to users on first load.`
+      : `The page is slow to visually populate, which feels sluggish to users on first load.`,
   "total-blocking-time": (a) =>
-    `The page is unresponsive to user input for ${a.displayValue} during load, causing noticeable input lag.`,
+    a.displayValue
+      ? `The page is unresponsive to user input for ${a.displayValue} during load, causing noticeable input lag.`
+      : `The page is unresponsive to user input for a prolonged stretch of the load, causing noticeable input lag.`,
   "cumulative-layout-shift": (a) =>
-    `The page layout shifts unexpectedly during load (CLS ${a.displayValue}), causing users to misclick or lose their reading place.`,
+    `The page layout shifts unexpectedly during load${a.displayValue ? ` (CLS ${a.displayValue})` : ""}, causing users to misclick or lose their reading place.`,
   interactive: (a) =>
-    `The page takes ${a.displayValue} before it can reliably respond to user input.`,
+    a.displayValue
+      ? `The page takes ${a.displayValue} before it can reliably respond to user input.`
+      : `The page takes a long time before it can reliably respond to user input.`,
+  // Lighthouse 13 changed this displayValue from a bare duration to a clause
+  // ("Root document took 780 ms"), which broke the original inlined phrasing.
   "server-response-time": (a) =>
-    `The server takes ${a.displayValue} to respond to the initial request, delaying every downstream load step.`,
+    a.displayValue
+      ? `${a.displayValue} to respond to the initial request, delaying every downstream load step.`
+      : `The server is slow to respond to the initial request, delaying every downstream load step.`,
+  "document-latency-insight": (a) =>
+    `The initial HTML document is slow to arrive${paren(a.displayValue)}; nothing else can start loading until it does, so this delay is paid by every other resource on the page.`,
   "render-blocking-resources": (a) =>
-    `Render-blocking scripts or styles are delaying the first paint (${a.displayValue}); users stare at a blank page longer than necessary.`,
+    `Render-blocking scripts or styles are delaying the first paint${paren(a.displayValue)}; users stare at a blank page longer than necessary.`,
   "unused-javascript": (a) =>
-    `The page ships JavaScript that is never executed (${a.displayValue}), inflating load time on slower connections.`,
+    `The page ships JavaScript that is never executed${paren(a.displayValue)}, inflating load time on slower connections.`,
   "unused-css-rules": (a) =>
-    `The page ships CSS rules that go unused (${a.displayValue}), wasting bytes on every visit.`,
+    `The page ships CSS rules that go unused${paren(a.displayValue)}, wasting bytes on every visit.`,
   "uses-responsive-images": (a) =>
-    `Images larger than their displayed size are being served (${a.displayValue}), wasting bandwidth on mobile users.`,
+    `Images larger than their displayed size are being served${paren(a.displayValue)}, wasting bandwidth on mobile users.`,
   "uses-optimized-images": (a) =>
-    `Images are not optimally compressed (${a.displayValue}); users on slower networks wait longer than necessary.`,
+    `Images are not optimally compressed${paren(a.displayValue)}; users on slower networks wait longer than necessary.`,
   "color-contrast": () =>
     `Text on the page does not have sufficient contrast against its background, making it hard to read for users with low vision.`,
   "image-alt": () =>
@@ -54,6 +82,96 @@ const QA_DESCRIPTIONS: Record<string, Templater> = {
     `The page is served over HTTP rather than HTTPS; browsers warn users that the connection is not secure.`,
   viewport: () =>
     `The page has no viewport meta tag; on mobile, content renders at desktop width and users must pinch-zoom to read.`,
+
+  // --- Responsiveness / main thread ---
+  "max-potential-fid": (a) =>
+    a.displayValue
+      ? `The worst-case delay between a user's first tap or click and the page reacting to it is ${a.displayValue}; users who interact early during load will feel the page freeze.`
+      : `There is a long worst-case delay between a user's first tap or click and the page reacting to it; users who interact early during load will feel the page freeze.`,
+  "mainthread-work-breakdown": (a) =>
+    a.displayValue
+      ? `The browser's main thread is busy for ${a.displayValue} during load, so scrolling, taps, and clicks are ignored or delayed while it catches up.`
+      : `The browser's main thread is busy for much of the load, so scrolling, taps, and clicks are ignored or delayed while it catches up.`,
+  "bootup-time": (a) =>
+    a.displayValue
+      ? `JavaScript occupies the main thread for ${a.displayValue}; on mid-range phones this is where most of the perceived slowness comes from.`
+      : `JavaScript occupies the main thread for a prolonged stretch of the load; on mid-range phones this is where most of the perceived slowness comes from.`,
+  "forced-reflow-insight": (a) =>
+    `Scripts read layout values immediately after changing the DOM, forcing the browser to recalculate layout mid-frame${paren(a.displayValue)}; this shows up as stutter during scroll and interaction.`,
+
+  // --- Console / runtime health ---
+  "errors-in-console": () =>
+    `The page logs JavaScript errors to the browser console during load. Each one is a code path that failed at runtime, and features downstream of it may be silently broken for real users.`,
+  deprecations: (a) =>
+    `The page relies on browser APIs that are deprecated${paren(a.displayValue)}; these will stop working in a future browser release and break the feature that depends on them.`,
+  "inspector-issues": () =>
+    `Chrome DevTools recorded issues against this page — typically blocked requests, cookie problems, or content-security violations. Each represents browser-enforced behaviour that may differ from what was tested locally.`,
+  "third-party-cookies": (a) =>
+    `The page sets third-party cookies${paren(a.displayValue)}. Browsers are phasing these out, so any feature depending on them — analytics, personalisation, embedded checkout — will degrade as that rollout completes.`,
+
+  // --- Caching / payload ---
+  "bf-cache": (a) =>
+    `The page blocks back/forward cache restoration${paren(a.displayValue)}, so pressing Back triggers a full reload instead of an instant restore — a visible regression on the most common navigation in a browsing session.`,
+  "cache-insight": (a) =>
+    `Static assets are served with short or missing cache lifetimes${paren(a.displayValue)}; returning visitors re-download content that has not changed.`,
+  // displayValue here is already a full clause ("Total size was 4,814 KiB"),
+  // unlike the bare metrics most audits report, so it leads the sentence
+  // instead of being inlined mid-clause.
+  "total-byte-weight": (a) =>
+    a.displayValue
+      ? `${a.displayValue} — a payload that size is slow and expensive to load for users on mobile data or metered connections.`
+      : `The page transfers more data than it needs to render, which is slow and expensive for users on mobile data or metered connections.`,
+  "unminified-javascript": (a) =>
+    `JavaScript is shipped unminified${paren(a.displayValue)}, sending comments and whitespace to every visitor.`,
+  "legacy-javascript-insight": (a) =>
+    `The bundle ships transpiled polyfills that modern browsers do not need${paren(a.displayValue)}, penalising up-to-date users to support ones that may no longer be in the support matrix.`,
+  "image-delivery-insight": (a) =>
+    `Images are not delivered in an optimal format or size${paren(a.displayValue)}; users on slower networks wait longer than necessary for the same visual result.`,
+  "unsized-images": () =>
+    `Images are missing explicit width and height attributes, so the browser cannot reserve space before they load and surrounding content jumps as each one arrives.`,
+
+  // --- Network / critical path ---
+  "render-blocking-insight": (a) =>
+    `Scripts or stylesheets block the first paint${paren(a.displayValue)}; users stare at a blank page until they finish downloading.`,
+  "lcp-discovery-insight": () =>
+    `The browser cannot discover the largest content element early — it is loaded lazily, injected by script, or not preloaded — so the main content paints later than the network allows.`,
+  "network-dependency-tree-insight": () =>
+    `Critical resources load in a long dependent chain rather than in parallel, so total load time is the sum of the chain instead of its slowest link.`,
+
+  // --- Accessibility (Lighthouse-side) ---
+  "aria-prohibited-attr": () =>
+    `An element carries an ARIA attribute that its role does not permit; assistive tech either ignores the attribute or announces the element incorrectly.`,
+  // Shared with the axe runner, whose rule ids match Lighthouse audit ids.
+  "aria-allowed-attr": () =>
+    `An element uses an ARIA attribute its role does not support; the attribute is ignored, so the state it was meant to convey — pressed, expanded, selected — never reaches screen-reader users.`,
+  "aria-required-children": () =>
+    `An ARIA role that requires specific child roles is missing them; assistive tech cannot interpret the widget and may skip or misannounce its contents.`,
+  "aria-required-parent": () =>
+    `An element with a child ARIA role sits outside the parent role it requires; screen readers lose the relationship and announce the item without its surrounding context.`,
+  "aria-valid-attr-value": () =>
+    `An ARIA attribute holds an invalid value, often an id reference pointing at an element that does not exist; the name or relationship it was meant to establish silently fails.`,
+  "duplicate-id-aria": () =>
+    `An id used by an ARIA reference appears more than once; the reference resolves to the wrong element, so labels and relationships attach to the wrong control.`,
+  "aria-dialog-name": () =>
+    `A dialog or alertdialog has no accessible name; screen-reader users are moved into a modal with no indication of what it is asking them to do.`,
+  "heading-order": () =>
+    `Heading levels skip a step (for example h2 straight to h4); screen-reader users navigating by heading get a broken outline and may believe content is missing.`,
+  "label-content-name-mismatch": () =>
+    `An element's visible text is not contained in its accessible name, so speech-control users saying the label they can see fail to activate the control.`,
+  "meta-viewport": () =>
+    `The viewport tag disables zooming (user-scalable="no" or maximum-scale under 5); low-vision users cannot pinch-zoom to read the page.`,
+
+  // --- SEO / crawlability ---
+  "link-text": (a) =>
+    `One or more links use non-descriptive text such as "click here"${paren(a.displayValue)}; screen-reader users listing links out of context cannot tell where they lead, and search engines gain no signal from the anchor.`,
+  "crawlable-anchors": () =>
+    `Links are not crawlable — they lack a resolvable href, so search engines cannot follow them and the destination pages may go unindexed.`,
+  "robots-txt": () =>
+    `robots.txt is invalid. Crawlers may misread the directives and either index pages meant to stay private or skip pages meant to rank.`,
+  "llms-txt": () =>
+    `llms.txt is missing or does not follow the recommended format, so AI agents fetching the site get no curated guide to its content.`,
+  "agent-accessibility-tree": () =>
+    `The accessibility tree is malformed, which degrades both screen readers and automated agents that navigate the page through it.`,
 };
 
 function fallbackDescription(audit: LighthouseAuditRef): string {
@@ -64,7 +182,7 @@ function fallbackDescription(audit: LighthouseAuditRef): string {
 export function formatLighthouseFinding(
   audit: LighthouseAuditRef,
 ): Finding | null {
-  const priority = lighthouseScoreToPriority(audit.score);
+  const priority = lighthouseImpactToPriority(audit.score, audit.weight);
   if (!priority) return null;
   const describe = QA_DESCRIPTIONS[audit.id];
   const description = describe ? describe(audit) : fallbackDescription(audit);
@@ -75,6 +193,10 @@ export function formatLighthouseFinding(
     evidence: {
       audit_id: audit.id,
       value: audit.displayValue ?? "",
+      // Why this landed where it did — weight is Lighthouse's own importance
+      // signal, and weight 0 marks a diagnostic that blocks nothing.
+      ...(audit.weight !== undefined ? { category_weight: audit.weight } : {}),
+      ...(audit.category ? { category: audit.category } : {}),
     },
   };
 }
@@ -328,9 +450,48 @@ export function formatStaticAnalysisFinding(
   };
 }
 
+/**
+ * axe rule ids are the same identifiers Lighthouse uses for its accessibility
+ * audits — Lighthouse runs axe internally — so an axe finding can borrow the
+ * QA prose already written for the matching Lighthouse audit instead of
+ * duplicating it. Falls back to axe's own help text, stripped of the trailing
+ * documentation URL that would otherwise land in a defect ticket.
+ */
+function axeDescription(violation: Pa11yViolation): string {
+  const shared = QA_DESCRIPTIONS[violation.code];
+  if (shared) {
+    return shared({ id: violation.code, displayValue: "" } as LighthouseAuditRef);
+  }
+  const cleaned = violation.message.replace(/\s*\(https?:\/\/[^)]*\)\s*$/, "").trim();
+  return cleaned
+    ? `${cleaned}. Flagged by axe as ${violation.impact ?? "unrated"} impact; assistive-tech users are likely affected.`
+    : `axe rule "${violation.code}" failed; assistive-tech users are likely affected.`;
+}
+
 export function formatA11yFinding(violation: Pa11yViolation): Finding | null {
   if (violation.type === "notice") return null;
-  const priority = wcagLevelToPriority(violation.wcagLevel);
+
+  if (violation.runner === "axe") {
+    const priority = axeImpactToPriority(violation.impact, violation.needsReview);
+    if (!priority) return null;
+    return {
+      priority,
+      title: violation.message.replace(/\s*\(https?:\/\/[^)]*\)\s*$/, "").trim() || violation.code,
+      description: axeDescription(violation),
+      evidence: {
+        rule_code: violation.code,
+        selector: violation.selector,
+        runner: "axe",
+        ...(violation.impact ? { axe_impact: violation.impact } : {}),
+        ...(violation.needsReview ? { needs_manual_review: true } : {}),
+      },
+    };
+  }
+
+  const priority = a11yTechniqueToPriority(
+    violation.technique,
+    violation.wcagLevel,
+  );
   if (!priority) return null;
   const describe = lookupA11yTemplate(violation.technique);
   const description = describe
