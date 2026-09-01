@@ -7,6 +7,7 @@ import {
   parseErrorResponse,
 } from "../utils/toolResponse.js";
 import { formatA11yFinding } from "../mappers/defectFormatter.js";
+import { dedupeA11yFindings } from "../mappers/a11yDedupe.js";
 import { sortFindingsByPriority } from "../mappers/priorityMapper.js";
 import type { Finding } from "../types.js";
 
@@ -60,17 +61,24 @@ export function registerAccessibilityTool(server: McpServer) {
         return parseErrorResponse("Failed to parse pa11y JSON", err, result);
       }
 
-      const findings: Finding[] = [];
+      const rawFindings: Finding[] = [];
       for (const violation of parsed.violations) {
         const finding = formatA11yFinding(violation);
-        if (finding) findings.push(finding);
+        if (finding) rawFindings.push(finding);
       }
+
+      // Collapse repeats of the same defect before counting or sorting — see
+      // a11yDedupe for why pa11y produces them.
+      const { findings, rawCount } = dedupeA11yFindings(rawFindings);
       sortFindingsByPriority(findings);
 
       const report = {
         url,
         standard: resolvedStandard,
         violation_count: findings.length,
+        // Pre-dedup total, so a large drop between the two is explainable
+        // rather than looking like dropped findings.
+        raw_violation_count: rawCount,
         findings,
       };
 

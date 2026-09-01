@@ -13,6 +13,14 @@ import {
   formatStaticAnalysisFinding,
   type StaticAnalysisIssue,
 } from "../mappers/defectFormatter.js";
+import { dedupeA11yFindings } from "../mappers/a11yDedupe.js";
+import {
+  lighthouseSubScore,
+  a11ySubScore,
+  staticSubScore,
+  compositeScore,
+  type SubScores,
+} from "../mappers/compositeScore.js";
 import { runESLint } from "../utils/eslintRunner.js";
 import {
   correlate,
@@ -34,6 +42,9 @@ interface ScorecardEntry {
   score?: number;
   breakdown?: Record<string, number>;
   issues?: number;
+  // pa11y only: raw occurrence count before (rule_code, selector) dedup.
+  // Present only when dedup actually collapsed something.
+  raw_issues?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +88,7 @@ async function runLighthouse(url: string): Promise<{
 
 async function runA11y(url: string): Promise<{
   violation_count: number;
+  raw_violation_count?: number;
   findings: Finding[];
   error?: string;
 }> {
@@ -95,12 +107,15 @@ async function runA11y(url: string): Promise<{
   }
   try {
     const parsed = parsePa11yJSON(result.stdout);
-    const findings: Finding[] = [];
+    const rawFindings: Finding[] = [];
     for (const v of parsed.violations) {
       const f = formatA11yFinding(v);
-      if (f) findings.push(f);
+      if (f) rawFindings.push(f);
     }
-    return { violation_count: findings.length, findings };
+    // Dedup before the findings reach the correlator and the composite score —
+    // 35 copies of one defect otherwise floor the score and swamp all_findings.
+    const { findings, rawCount } = dedupeA11yFindings(rawFindings);
+    return { violation_count: findings.length, raw_violation_count: rawCount, findings };
   } catch (err) {
     return {
       violation_count: 0, findings: [],
@@ -166,15 +181,19 @@ function buildVerdict(findings: CorrelatedFinding[]): ReleaseReadiness {
   return "CLEAR";
 }
 
-// Option 5: severity-weighted composite score (100 = perfect health)
-function buildCompositeScore(findings: CorrelatedFinding[]): number {
-  let score = 100;
-  for (const f of findings) {
-    if (f.priority === "P1") score -= 15;
-    else if (f.priority === "P2") score -= 7;
-    else score -= 3;
-  }
-  return Math.max(0, score);
+// Composite score. See src/mappers/compositeScore.ts for why this is a
+// weighted mean of per-tool sub-scores rather than one global subtraction.
+function buildSubScores(
+  lhData: { scores: Record<string, number>; error?: string } | null,
+  a11yData: { findings: Finding[]; error?: string } | null,
+  staticData: { findings: Finding[] } | null,
+): SubScores {
+  return {
+    lighthouse:
+      lhData && !lhData.error ? lighthouseSubScore(lhData.scores) : null,
+    pa11y: a11yData && !a11yData.error ? a11ySubScore(a11yData.findings) : null,
+    static: staticData ? staticSubScore(staticData.findings) : null,
+  };
 }
 
 // Option 3: compact per-tool scorecard
@@ -183,7 +202,12 @@ function buildCompositeScore(findings: CorrelatedFinding[]): number {
 // UNAVAILABLE is reserved for tools that were attempted but failed or are not installed.
 function buildScorecard(
   lhData: { scores: Record<string, number>; error?: string } | null,
-  a11yData: { violation_count: number; findings: Finding[]; error?: string } | null,
+  a11yData: {
+    violation_count: number;
+    raw_violation_count?: number;
+    findings: Finding[];
+    error?: string;
+  } | null,
   staticData: { issue_count: number; findings: Finding[] } | null,
 ): ScorecardEntry[] {
   const entries: ScorecardEntry[] = [];
@@ -212,10 +236,14 @@ function buildScorecard(
   } else {
     const hasP1 = a11yData.findings.some((f) => f.priority === "P1");
     const hasP2 = a11yData.findings.some((f) => f.priority === "P2");
+    const raw = a11yData.raw_violation_count;
     entries.push({
       tool: "pa11y",
       gate: hasP1 ? "FAIL" : hasP2 ? "WARN" : "PASS",
       issues: a11yData.violation_count,
+      ...(raw !== undefined && raw > a11yData.violation_count
+        ? { raw_issues: raw }
+        : {}),
     });
   }
 
@@ -393,13 +421,17 @@ export function registerQaGateTool(server: McpServer): void {
       ];
 
       const readiness = buildVerdict(allFindings);
-      const compositeScore = buildCompositeScore(allFindings);
+      const subScores = buildSubScores(lhData, a11yData, staticData);
+      const composite = compositeScore(subScores);
       const scorecard = buildScorecard(lhData, a11yData, staticData);
       const summary = buildSummary(allFindings, toolsRan, readiness, correlations_count);
 
       const report: Record<string, unknown> = {
         release_readiness: readiness,
-        composite_score: compositeScore,
+        composite_score: composite,
+        // Per-tool 0–100 health, so a low composite is attributable rather than
+        // just low. Null means the tool did not run or did not produce a score.
+        sub_scores: subScores,
         scorecard,
         ...(staticData ? { eslint_config_used: staticData.eslint_config_used } : {}),
         summary,
@@ -416,7 +448,7 @@ export function registerQaGateTool(server: McpServer): void {
           url,
           path: targetPath,
           release_readiness: readiness,
-          composite_score: compositeScore,
+          composite_score: composite ?? 0,
           scorecard,
           summary,
           corroborated_findings: corroboratedFindings as unknown as Array<Record<string, unknown>>,

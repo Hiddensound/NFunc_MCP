@@ -6,6 +6,17 @@ export interface LighthouseAuditRef {
   displayValue: string;
   numericValue?: number;
   numericUnit?: string;
+  /**
+   * The audit's weight inside its Lighthouse category, taken from
+   * categories[].auditRefs[]. This is Lighthouse's own statement of how much
+   * the audit matters: weight 0 means it is a diagnostic that contributes
+   * nothing to the category score. Undefined when the audit belongs to no
+   * category (rare — treat as unknown, not as zero).
+   */
+  weight?: number;
+  /** Highest-weighted category the audit belongs to, for traceability. */
+  category?: string;
+  scoreDisplayMode?: string;
 }
 
 export interface ParsedLighthouse {
@@ -17,7 +28,13 @@ export interface ParsedLighthouse {
 
 export function parseLighthouseJSON(rawJson: string): ParsedLighthouse {
   const lhr = JSON.parse(rawJson) as {
-    categories?: Record<string, { score: number | null }>;
+    categories?: Record<
+      string,
+      {
+        score: number | null;
+        auditRefs?: Array<{ id?: string; weight?: number }>;
+      }
+    >;
     audits?: Record<
       string,
       {
@@ -28,14 +45,26 @@ export function parseLighthouseJSON(rawJson: string): ParsedLighthouse {
         displayValue?: string;
         numericValue?: number;
         numericUnit?: string;
+        scoreDisplayMode?: string;
       }
     >;
   };
 
   const categoryScores: Record<string, number> = {};
+  // An audit can appear in more than one category; keep the highest weight,
+  // since that is the strongest claim Lighthouse makes about its importance.
+  const auditWeights: Record<string, { weight: number; category: string }> = {};
+
   for (const [key, cat] of Object.entries(lhr.categories ?? {})) {
     if (typeof cat?.score === "number") {
       categoryScores[key] = Math.round(cat.score * 100);
+    }
+    for (const ref of cat?.auditRefs ?? []) {
+      if (!ref.id || typeof ref.weight !== "number") continue;
+      const prev = auditWeights[ref.id];
+      if (!prev || ref.weight > prev.weight) {
+        auditWeights[ref.id] = { weight: ref.weight, category: key };
+      }
     }
   }
 
@@ -56,6 +85,7 @@ export function parseLighthouseJSON(rawJson: string): ParsedLighthouse {
     if (audit?.score === null || audit?.score === undefined) continue;
     const scorePct = Math.round(audit.score * 100);
     if (scorePct >= 90) continue;
+    const weightRef = auditWeights[id];
     failedAudits.push({
       id,
       title: audit.title ?? id,
@@ -65,6 +95,9 @@ export function parseLighthouseJSON(rawJson: string): ParsedLighthouse {
       numericValue:
         typeof audit.numericValue === "number" ? audit.numericValue : undefined,
       numericUnit: audit.numericUnit,
+      weight: weightRef?.weight,
+      category: weightRef?.category,
+      scoreDisplayMode: audit.scoreDisplayMode,
     });
   }
 
