@@ -24,9 +24,14 @@ A local MCP server that gives Claude (or any MCP client) a full non-functional Q
 7. [Individual tools](#individual-tools)
    - [Mobile vs desktop](#mobile-vs-desktop)
    - [Choosing an accessibility engine](#choosing-an-accessibility-engine)
-8. [Priority system](#priority-system)
-9. [Project layout](#project-layout)
-10. [How to prompt](#how-to-prompt)
+8. [PSI performance audit](#psi-performance-audit-plan_--run_performance_audit)
+   - [Why two tools](#why-two-tools)
+   - [What PSI adds over run_lighthouse](#what-psi-adds-over-run_lighthouse)
+   - [Where PSI does not work](#where-psi-does-not-work)
+   - [Chunking and time](#chunking-and-time)
+9. [Priority system](#priority-system)
+10. [Project layout](#project-layout)
+11. [How to prompt](#how-to-prompt)
 
 ---
 
@@ -57,6 +62,14 @@ The `run_qa_gate` orchestrator runs all of them in parallel, cross-correlates fi
 | pa11y | `npm install -g pa11y` | `run_accessibility_check`, `run_qa_gate` (URL) |
 | ESLint | `npm install -g eslint` | `run_static_analysis`, `run_qa_gate` (path) |
 | Semgrep | `brew install semgrep` or `pip install semgrep` | `run_static_analysis`, `run_qa_gate` (path) |
+
+The PSI tools need no CLI — they call an HTTP API — but they do want a key:
+
+| What | How | Used by |
+|---|---|---|
+| PageSpeed Insights API key | Enable the PageSpeed Insights API in the Google Cloud console, then set `PAGESPEED_API_KEY` | `plan_performance_audit`, `run_performance_audit` |
+
+Set it in the `env` block of your MCP client config rather than a `.env` file — the client launches this server, so it controls the environment. Without a key the tools still work, but they are capped at 4 runs because the shared anonymous quota is exhausted in practice.
 
 Verify each is reachable:
 
@@ -134,6 +147,8 @@ claude mcp add nfunc-mcp -- node /absolute/path/to/NFunc_MCP/dist/index.js
 | `run_accessibility_check` | pa11y WCAG audit for a URL | `url`, `runner` (optional), `standard` (optional), `ignore` (optional) |
 | `run_static_analysis` | ESLint + Semgrep scan for a local codebase | `path` |
 | `run_qa_gate` | All tools in parallel + correlation + HTML report | `url` and/or `path`, `form_factor` (optional), `a11y_runner` (optional) |
+| `plan_performance_audit` | Plans a PageSpeed Insights audit — discovers URLs, clusters them into templates, costs the run. Spends no PSI quota | `origin`, `discovery` (optional), `urls`/`csv_path` (optional), `max_templates` (optional) |
+| `run_performance_audit` | Executes an approved PSI audit — lab scores, CrUX real-user field data, and the disagreements between them | `pages`, `strategy` (optional), `runs_per_url` (optional), `cursor` (optional) |
 
 ---
 
@@ -369,6 +384,57 @@ Returns: `path`, `tools_run`, `eslint_config_used`, `issue_count`, `findings`, `
 
 ---
 
+## PSI performance audit (`plan_` / `run_performance_audit`)
+
+Two tools that wrap the Google PageSpeed Insights API. They are **exclusive and opt-in** — `run_qa_gate` never calls them. Use them when someone explicitly asks for a PSI audit, a Core Web Vitals report, or real-user field data.
+
+### Why two tools
+
+An MCP tool cannot ask a question mid-call. A useful audit needs several decisions first — which URLs, how many per template, what to do about pages PSI cannot reach — so the work is split:
+
+1. `plan_performance_audit` discovers, classifies and costs the run, then returns a `questions` array. It spends **no quota**.
+2. You put those questions to the user.
+3. `run_performance_audit` executes the approved page list.
+
+A misclassified template should cost a conversation turn, not forty API calls.
+
+### What PSI adds over `run_lighthouse`
+
+One PSI call returns two independent datasets: a Lighthouse run on Google's infrastructure (**lab**) and Chrome UX Report data for the URL (**field** — real users, 28-day 75th percentile). `run_lighthouse` gives you the first. Only PSI gives you the second, and the disagreement between them is the point:
+
+| Lab | Field | Meaning |
+|---|---|---|
+| Pass | Pass | Genuinely fine |
+| Fail | Pass | The lab profile is harsher than the real audience — deprioritise |
+| **Pass** | **Fail** | **The test environment is lying to you.** Real users hit something the simulation does not |
+| Fail | Fail | Confirmed by two independent measurements |
+
+Row three is invisible to every other tool in this server. On one real commerce homepage the lab reported a perfect CLS of 0 while real users were at 0.55 — 5.5× the "poor" threshold, affecting 70% of them.
+
+CrUX is **not real-time**. It is a 28-day trailing aggregate. It is valuable because it is real users, not because it is current.
+
+### Where PSI does not work
+
+- **Localhost and private hosts** — PSI fetches from Google's infrastructure. Rejected at preflight; use `run_lighthouse`.
+- **Cart, checkout, account pages** — PSI fetches anonymously, so it would measure an empty cart or a login redirect. The plan tool flags these and routes them to `run_lighthouse`, which can carry session cookies.
+- **Low-traffic URLs** — reachable, but with no CrUX data. You get a lab-only audit, labelled as such. Staging and preview deployments are always in this category, which is why PSI is optional for non-production environments and authoritative for hosted ones.
+
+### Chunking and time
+
+PSI is slow and erratic: measured latency on live runs ranged from 10 s to 57 s for the same URL, with occasional hangs and intermittent 500s. Roughly one run in three failed on one origin.
+
+`run_performance_audit` therefore runs in chunks. Each call is bounded by `max_seconds_per_call` (default 150) and returns a `cursor`; keep calling until `complete` is true. Raw reports are written to `output_dir` as they land and merged into `_index.json`, so nothing completed is ever lost.
+
+**Re-run to fill gaps.** Call again with the same pages and no cursor — completed page/strategy pairs are skipped automatically, so only the failures are retried.
+
+### Reading the output
+
+The final call returns an `aggregate` block holding every cross-page number: per-strategy means, universal failures, CWV verdict tallies, lab-versus-field counts, outliers. **Quote those rather than recomputing them.** Two redundancy rules also apply there — a vital failing nearly everywhere with little variation collapses into one systemic finding, and FCP is folded into LCP when both fail on a page.
+
+`docs/psi-report-spec.md` is the full guide to turning that output into a written report.
+
+---
+
 ## Priority system
 
 | Priority | Meaning | Lighthouse threshold | WCAG level | ESLint / Semgrep |
@@ -393,6 +459,8 @@ qa-mcp/
 │   │   └── qa-mcp-baseline.eslint.config.js  # Fallback ESLint config
 │   ├── tools/
 │   │   ├── qaGate.ts                    # Orchestrator — runs all tools, builds report
+│   │   ├── performanceAuditPlan.ts      # plan_performance_audit tool
+│   │   ├── performanceAudit.ts          # run_performance_audit tool
 │   │   ├── lighthouse.ts                # run_lighthouse tool
 │   │   ├── accessibility.ts             # run_accessibility_check tool
 │   │   └── staticAnalysis.ts            # run_static_analysis tool
@@ -403,9 +471,18 @@ qa-mcp/
 │   └── utils/
 │       ├── reportGenerator.ts           # HTML report builder
 │       ├── shellRunner.ts               # CLI execution with timeout + error handling
+│       ├── httpClient.ts                # HTTP execution with timeout, retry, redaction
+│       ├── psiParser.ts                 # PSI response → lab metrics + CrUX field data
+│       ├── psiAuth.ts                   # API key resolution
+│       ├── sitemapReader.ts             # robots.txt + sitemap discovery
+│       ├── urlClassifier.ts             # URL list → page templates
+│       ├── csvReader.ts                 # URL extraction from a CSV
+│       ├── publicUrl.ts                 # Public reachability + session-gate checks
 │       ├── outputParsers.ts             # JSON parsers for each tool's output
 │       ├── eslintConfigDetector.ts      # Detects project ESLint config
 │       └── toolResponse.ts             # MCP error response helpers
+├── docs/
+│   └── psi-report-spec.md               # How to write the PSI audit report
 ├── dist/                                # Compiled output (gitignored)
 ├── package.json
 ├── tsconfig.json
