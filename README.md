@@ -2,42 +2,17 @@
 
 [![npm](https://img.shields.io/npm/v/nfunc-mcp)](https://www.npmjs.com/package/nfunc-mcp)
 
-A local MCP server that gives Claude (or any MCP client) a full non-functional QA toolkit. Run Lighthouse, WCAG accessibility checks, and static code analysis — individually or all at once — and get back structured, prioritised findings you can act on immediately.
+A local MCP server that gives Claude a non-functional QA toolkit. Performance,
+accessibility, SEO, code quality and real-user Core Web Vitals — run
+individually or all at once, returned as prioritised findings you can act on
+rather than raw tool output.
 
----
-
-## Table of contents
-
-1. [What it does](#what-it-does)
-2. [Prerequisites](#prerequisites)
-3. [Install & build](#install--build)
-4. [Register with Claude Code](#register-with-claude-code)
-5. [Tools](#tools)
-6. [run_qa_gate — the main tool](#run_qa_gate--the-main-tool)
-   - [Inputs](#inputs)
-   - [Release readiness tiers](#release-readiness-tiers)
-   - [Composite score](#composite-score)
-   - [Scorecard](#scorecard)
-   - [Cross-tool corroboration](#cross-tool-corroboration)
-   - [HTML report](#html-report)
-   - [Output shape](#output-shape)
-7. [Individual tools](#individual-tools)
-   - [Mobile vs desktop](#mobile-vs-desktop)
-   - [Choosing an accessibility engine](#choosing-an-accessibility-engine)
-8. [PSI performance audit](#psi-performance-audit-plan_--run_performance_audit)
-   - [Why two tools](#why-two-tools)
-   - [What PSI adds over run_lighthouse](#what-psi-adds-over-run_lighthouse)
-   - [Where PSI does not work](#where-psi-does-not-work)
-   - [Chunking and time](#chunking-and-time)
-9. [Priority system](#priority-system)
-10. [Project layout](#project-layout)
-11. [How to prompt](#how-to-prompt)
+> **[Operating manual →](docs/manual.md)** — installation options, per-tool
+> reference, output shapes, troubleshooting.
 
 ---
 
 ## What it does
-
-`nfunc-mcp` wires four QA tools into Claude's tool-use loop:
 
 | Capability | Tools | What it checks |
 |---|---|---|
@@ -47,453 +22,58 @@ A local MCP server that gives Claude (or any MCP client) a full non-functional Q
 | Best practices | Lighthouse | HTTPS, deprecated APIs, third-party cookies |
 | Code quality | ESLint | Dead code, undeclared vars, swallowed errors |
 | Security patterns | Semgrep | OWASP JS/TS patterns |
+| Real-user vitals | PageSpeed Insights + CrUX | What actual visitors experienced, versus what the lab measures |
 
-The `run_qa_gate` orchestrator runs all of them in parallel, cross-correlates findings across tools, and produces a single structured report with a release readiness verdict, a composite health score, a per-tool scorecard, and a browser-openable HTML report.
-
----
-
-## Prerequisites
-
-`nfunc-mcp` is a thin wrapper around four CLI tools. Install the ones you need before registering the server:
-
-| Tool | Install | Used by |
-|---|---|---|
-| Lighthouse | `npm install -g lighthouse` | `run_lighthouse`, `run_qa_gate` (URL) |
-| pa11y | `npm install -g pa11y` | `run_accessibility_check`, `run_qa_gate` (URL) |
-| ESLint | `npm install -g eslint` | `run_static_analysis`, `run_qa_gate` (path) |
-| Semgrep | `brew install semgrep` or `pip install semgrep` | `run_static_analysis`, `run_qa_gate` (path) |
-
-The PSI tools need no CLI — they call an HTTP API — but they do want a key:
-
-| What | How | Used by |
-|---|---|---|
-| PageSpeed Insights API key | Enable the PageSpeed Insights API in the Google Cloud console, then set `PAGESPEED_API_KEY` | `plan_performance_audit`, `run_performance_audit` |
-
-Set it in the `env` block of your MCP client config rather than a `.env` file — the client launches this server, so it controls the environment. Without a key the tools still work, but they are capped at 4 runs because the shared anonymous quota is exhausted in practice.
-
-Verify each is reachable:
-
-```bash
-lighthouse --version
-pa11y --version
-eslint --version
-semgrep --version
-```
-
-**You don't need all four.** If a tool is missing or not installed, the gate still runs — that tool's scorecard entry shows `UNAVAILABLE` and its findings are skipped. URL-only runs only need Lighthouse and pa11y; path-only runs only need ESLint and Semgrep.
+Findings arrive prioritised **P1 / P2 / P3**, written as defect-ticket prose
+rather than audit jargon, with passing checks filtered out. Nothing that passes
+is ever reported.
 
 ---
 
-## Install & register
-
-### Option A — npm (recommended, no cloning needed)
+## Quick start
 
 ```bash
 claude mcp add nfunc-mcp -- npx -y nfunc-mcp
 ```
 
-That's it. `npx` downloads and runs the server on your machine automatically. No repo clone, no build step.
+Then install whichever CLIs you need — `lighthouse`, `pa11y`, `eslint`,
+`semgrep`. Missing tools are skipped rather than fatal, so start with what you
+have. For real-user field data, add a
+[PageSpeed Insights key](docs/manual.md#pagespeed-insights-api-key).
 
-### Option B — Manual config (npm)
+Verify with `/mcp`, then ask Claude to *"call the nfunc-mcp ping tool."*
 
-Add to `~/.claude.json` under `mcpServers`:
+[Other install options →](docs/manual.md#install-and-register)
 
-```json
-{
-  "mcpServers": {
-    "nfunc-mcp": {
-      "command": "npx",
-      "args": ["-y", "nfunc-mcp"]
-    }
-  }
-}
-```
+---
 
-### Option C — From source (contributors / local dev)
+## The tools
 
-```bash
-git clone https://github.com/Hiddensound/NFunc_MCP.git
-cd NFunc_MCP
-npm install
-npm run build
-claude mcp add nfunc-mcp -- node /absolute/path/to/NFunc_MCP/dist/index.js
-```
-
-### Scripts (source only)
-
-| Script | Purpose |
+| Tool | What it does |
 |---|---|
-| `npm run build` | Compile TypeScript → `dist/` |
-| `npm start` | Run the compiled server |
-| `npm run dev` | Run from source with hot reload (`tsx watch`) |
+| **`run_qa_gate`** | **The one to reach for.** Runs everything applicable in parallel, correlates findings across tools, and returns a release verdict, a composite score, a per-tool scorecard and an HTML report. |
+| `run_lighthouse` | Lighthouse for a URL. `form_factor: "both"` finds device-specific defects the single profiles miss. |
+| `run_accessibility_check` | pa11y WCAG audit. `runner: "axe"` for ARIA and design systems; `"both"` for the widest sweep. |
+| `run_static_analysis` | ESLint + Semgrep over a local codebase. Uses your ESLint config if it finds one. |
+| `plan_performance_audit` | Plans a PageSpeed Insights audit — finds your URLs, groups them into page templates, costs the run. **Spends no quota.** |
+| `run_performance_audit` | Runs it. Lab scores, real-user field data, and the disagreements between them. |
+| `ping` | Health check. |
 
-### Verify the connection
+### Which one when
 
-1. Run `/mcp` in Claude Code — `nfunc-mcp` should show as `connected`.
-2. Ask Claude: *"Call the nfunc-mcp ping tool."*
-3. Expected response:
-   ```json
-   { "status": "ok", "timestamp": "2026-05-20T12:00:00.000Z" }
-   ```
+- **Shipping something?** `run_qa_gate`. It is the default answer.
+- **One dimension in depth?** The individual tool — `run_lighthouse` for a perf
+  regression, `run_accessibility_check` for an a11y pass.
+- **"Is the site actually fast for real people?"** The PSI pair. This is the
+  only thing here that measures real visitors instead of a simulation, and it
+  routinely disagrees with the lab.
 
----
-
-## Tools
-
-| Tool | Description | Inputs |
-|---|---|---|
-| `ping` | Health check — confirms the server is up | — |
-| `run_lighthouse` | Full Lighthouse audit for a URL | `url`, `form_factor` (optional), `categories` (optional), `thresholds` (optional) |
-| `run_accessibility_check` | pa11y WCAG audit for a URL | `url`, `runner` (optional), `standard` (optional), `ignore` (optional) |
-| `run_static_analysis` | ESLint + Semgrep scan for a local codebase | `path` |
-| `run_qa_gate` | All tools in parallel + correlation + HTML report | `url` and/or `path`, `form_factor` (optional), `a11y_runner` (optional) |
-| `plan_performance_audit` | Plans a PageSpeed Insights audit — discovers URLs, clusters them into templates, costs the run. Spends no PSI quota | `origin`, `discovery` (optional), `urls`/`csv_path` (optional), `max_templates` (optional) |
-| `run_performance_audit` | Executes an approved PSI audit — lab scores, CrUX real-user field data, and the disagreements between them | `pages`, `strategy` (optional), `runs_per_url` (optional), `cursor` (optional) |
+The PSI tools are **opt-in** — `run_qa_gate` never calls them, because they
+spend API quota and take minutes rather than seconds.
 
 ---
 
-## run_qa_gate — the main tool
-
-This is the tool to reach for in nearly every QA workflow. It replaces running tools individually and adds cross-tool intelligence on top.
-
-### Inputs
-
-Both inputs are **optional** — provide whichever you have. At least one is required.
-
-| Input | Type | When to provide |
-|---|---|---|
-| `url` | string (URL) | You have a running page — production, staging, preview URL, or localhost. Enables Lighthouse and pa11y. |
-| `path` | string (path) | You have a local codebase. Enables ESLint and Semgrep. |
-| `context` | string | Optional. Free-text description of the project (e.g. `"React e-commerce checkout"`). Helps Claude interpret results. |
-| `form_factor` | `mobile` \| `desktop` \| `both` | Optional, default `mobile`. Lighthouse device profile — see [Mobile vs desktop](#mobile-vs-desktop). |
-| `a11y_runner` | `htmlcs` \| `axe` \| `both` | Optional, default `htmlcs`. pa11y engine — see [Choosing an accessibility engine](#choosing-an-accessibility-engine). |
-
-**URL only** — browser-based checks, static analysis skipped:
-```
-QA snapshot — https://staging.myapp.com
-```
-
-**Path only** — static analysis only, browser checks skipped:
-```
-QA snapshot — /path/to/my-feature-branch
-```
-
-**Both** — full suite:
-```
-QA snapshot — https://staging.myapp.com, code at /path/to/repo
-```
-
-### Release readiness tiers
-
-The `release_readiness` field replaces a binary pass/fail with four actionable tiers:
-
-| Value | Meaning | Condition |
-|---|---|---|
-| `BLOCKED` | Cannot ship — P1 issues exist | Any P1 finding |
-| `CONDITIONAL` | Shippable with caveats — track P2s before merging | P2 findings, no P1s |
-| `ADVISORY` | Safe to ship — P3s are tech debt to log | Only P3 findings |
-| `CLEAR` | No issues detected | Zero findings |
-
-### Composite score
-
-A single `composite_score` (0–100) gives a continuous health measure across all tools.
-
-**Formula:** Start at 100, deduct by finding severity:
-
-| Priority | Deduction |
-|---|---|
-| P1 | −15 per finding |
-| P2 | −7 per finding |
-| P3 | −3 per finding |
-
-Score is floored at 0. Tracks improvement over time — a score trending upward sprint-over-sprint is a healthy signal.
-
-### Scorecard
-
-A compact `scorecard` array gives a one-line status per tool:
-
-```json
-[
-  { "tool": "Lighthouse",       "gate": "WARN", "score": 75,
-    "breakdown": { "performance": 52, "accessibility": 98, "seo": 100, "best-practices": 58 } },
-  { "tool": "pa11y",            "gate": "PASS", "issues": 0 },
-  { "tool": "ESLint / Semgrep", "gate": "SKIPPED" }
-]
-```
-
-Gate values:
-
-| Gate | Meaning |
-|---|---|
-| `PASS` | No issues at this tool's threshold |
-| `WARN` | Issues exist but below the FAIL threshold |
-| `FAIL` | Issues at P1 level (or Lighthouse avg < 50) |
-| `SKIPPED` | Input not provided (URL or path not supplied) |
-| `UNAVAILABLE` | Tool was invoked but is not installed or errored |
-
-### Cross-tool corroboration
-
-When Lighthouse and pa11y independently flag the same accessibility gap, those findings are:
-
-1. **Merged** into a single entry in `corroborated_findings`
-2. **Priority-promoted** one tier (P3→P2, P2→P1)
-3. **Annotated** with `confidence: "high"` and `confirmed_by: ["lighthouse", "pa11y"]`
-
-These are the highest-confidence findings in any report — two independent tools agreeing is stronger evidence than either alone. They appear in their own dedicated section above all other findings, and bubble to the top of `top_issues`.
-
-**Corroboration mapping (Rule 1):**
-
-| Lighthouse audit | pa11y technique |
-|---|---|
-| `color-contrast` | `.G18`, `.G145`, `.G174` |
-| `image-alt` | `.H37`, `.H67`, `.F65` |
-| `label` | `.H44`, `.F68`, `.H91.Input` |
-| `link-name` | `.H30`, `.H91.A.` |
-| `html-has-lang` | `.H57` |
-| `button-name` | `.H91.Button` |
-| *(and more)* | |
-
-**Performance ↔ code linkage (Rule 2):** If a Lighthouse performance finding's display value contains a filename that also appears in a static analysis finding, the static finding is added as `related_findings` on the Lighthouse entry. Findings are not merged — they remain linked by reference.
-
-### HTML report
-
-Every `run_qa_gate` call automatically writes a self-contained HTML file to `/tmp` and returns its path as `report_file`:
-
-```json
-{
-  "report_file": "file:///tmp/qa-report-myapp-com-1234567890.html"
-}
-```
-
-Open the path in any browser to get:
-
-- Release readiness banner (colour-coded)
-- Composite score gauge (SVG arc, 0–100)
-- Per-tool scorecard table
-- Cross-confirmed findings section (highlighted)
-- Collapsible finding cards grouped by P1 / P2 / P3
-- Evidence and selector for each finding
-
-No server required — the file is fully self-contained with inline CSS.
-
-### Output shape
-
-```jsonc
-{
-  "release_readiness": "BLOCKED",        // BLOCKED | CONDITIONAL | ADVISORY | CLEAR
-  "composite_score": 22,                 // 0–100
-  "report_file": "file:///tmp/qa-report-xxx.html",
-  "scorecard": [ ... ],                  // per-tool gate + score/issues
-  "eslint_config_used": "project",       // present only when path was supplied
-  "summary": "110 findings (101 P1, 9 P2) across 2 tools. ...",
-  "corroborated_findings": [ ... ],      // cross-confirmed, confidence: "high"
-  "top_issues": [ ... ],                 // top 3 findings (corroborated first)
-  "all_findings": [ ... ],               // all findings sorted by priority
-  "correlations_found": 1,
-  "errors": [ ... ]                      // present only if a tool errored
-}
-```
-
-Each finding:
-
-```jsonc
-{
-  "priority": "P1",                      // P1 | P2 | P3
-  "title": "Largest Contentful Paint",
-  "description": "Users see main content 34s after navigation...",
-  "evidence": { "audit_id": "largest-contentful-paint", "value": "34.3 s" },
-  "source_tool": "lighthouse",
-  // corroborated findings also have:
-  "confirmed_by": ["lighthouse", "pa11y"],
-  "confidence": "high"
-}
-```
-
----
-
-## Individual tools
-
-### run_lighthouse
-
-Runs a full Lighthouse audit against a URL.
-
-```
-Run Lighthouse on https://myapp.com
-Run Lighthouse on https://myapp.com for mobile and desktop
-```
-
-Returns: `url`, `form_factor`, `scores` (per category), `ttfb_ms`, `findings` (priority-ordered).
-
-#### Mobile vs desktop
-
-`form_factor` accepts `desktop` (default), `mobile`, or `both`.
-
-**This default deliberately differs from the Lighthouse CLI's**, which is mobile: a 412×823 screen, a mid-range Android user agent, simulated slow 4G, and a **4× CPU slowdown**. That profile is much harsher and reports substantially lower performance scores for the same page, so passing `mobile` here is not a like-for-like comparison with a default run — check `form_factor` in the response before comparing two reports.
-
-**The two are not interchangeable.** They render different DOM, so they find different defects — not just different performance numbers. Measured against one commerce category page:
-
-| | Mobile | Desktop |
-|---|---|---|
-| performance | 54 | 62 |
-| accessibility | **87** | **73** |
-| seo | 77 | 69 |
-
-Five accessibility audits failed on desktop that mobile never reported — `image-alt`, `aria-required-children`, `aria-required-parent`, `aria-allowed-attr`, `aria-valid-attr-value` — while three others failed only on mobile. Neither profile is a superset of the other.
-
-With `form_factor: "both"`, the two run concurrently (so it costs little more wall time than one), `scores` is keyed by form factor, and each finding carries `affects_form_factors` and `form_factor_specific` so device-only regressions are obvious at a glance.
-
-### run_accessibility_check
-
-Runs pa11y against a URL at WCAG 2 AA by default. Returns only violations (errors) — use the CLI directly with `--include-notices --include-warnings` for the full checklist.
-
-```
-Run an accessibility check on https://myapp.com
-Run accessibility check at AAA standard on https://myapp.com
-Run an accessibility check on https://myapp.com using the axe runner
-```
-
-Returns: `url`, `standard`, `runners`, `violation_count`, `raw_violation_count`, `findings`.
-
-#### Choosing an accessibility engine
-
-`runner` accepts `htmlcs` (default), `axe`, or `both`.
-
-| Engine | Strongest at | Severity source |
-|---|---|---|
-| `htmlcs` | WCAG techniques, document structure, form labelling, duplicate ids | WCAG technique class |
-| `axe` | **ARIA** — invalid roles, missing required parent/child relationships, prohibited and unsupported attributes — and computed colour contrast | axe's own `impact` rating |
-
-**Reach for `axe` whenever the work under test involves ARIA, a component library, or a design system.** The overlap between the engines is smaller than you would expect. On the same page:
-
-- htmlcs found unlabelled inputs, forms with no submit mechanism, and ten duplicate ids that axe did not report.
-- axe found `aria-allowed-attr`, `aria-prohibited-attr`, `aria-required-parent`, `aria-required-children` and `image-alt` failures that htmlcs missed entirely.
-
-`both` runs them concurrently and merges the results. Note that an element flagged by both engines appears twice, because they emit different rule codes for the same defect — that is deliberate, since two independent engines agreeing is corroboration worth seeing.
-
-Findings from axe carry `axe_impact` in evidence, and `needs_manual_review: true` where axe wants a human to confirm (those are demoted one priority tier — a maybe should not gate a release as hard as a certainty).
-
-### run_static_analysis
-
-Runs ESLint and Semgrep in parallel against a local directory. Automatically uses the project's own ESLint config if one is found; otherwise falls back to a QA-focused baseline config.
-
-```
-Run static analysis on /path/to/repo
-```
-
-Returns: `path`, `tools_run`, `eslint_config_used`, `issue_count`, `findings`, `warnings`.
-
----
-
-## PSI performance audit (`plan_` / `run_performance_audit`)
-
-Two tools that wrap the Google PageSpeed Insights API. They are **exclusive and opt-in** — `run_qa_gate` never calls them. Use them when someone explicitly asks for a PSI audit, a Core Web Vitals report, or real-user field data.
-
-### Why two tools
-
-An MCP tool cannot ask a question mid-call. A useful audit needs several decisions first — which URLs, how many per template, what to do about pages PSI cannot reach — so the work is split:
-
-1. `plan_performance_audit` discovers, classifies and costs the run, then returns a `questions` array. It spends **no quota**.
-2. You put those questions to the user.
-3. `run_performance_audit` executes the approved page list.
-
-A misclassified template should cost a conversation turn, not forty API calls.
-
-### What PSI adds over `run_lighthouse`
-
-One PSI call returns two independent datasets: a Lighthouse run on Google's infrastructure (**lab**) and Chrome UX Report data for the URL (**field** — real users, 28-day 75th percentile). `run_lighthouse` gives you the first. Only PSI gives you the second, and the disagreement between them is the point:
-
-| Lab | Field | Meaning |
-|---|---|---|
-| Pass | Pass | Genuinely fine |
-| Fail | Pass | The lab profile is harsher than the real audience — deprioritise |
-| **Pass** | **Fail** | **The test environment is lying to you.** Real users hit something the simulation does not |
-| Fail | Fail | Confirmed by two independent measurements |
-
-Row three is invisible to every other tool in this server. On one real commerce homepage the lab reported a perfect CLS of 0 while real users were at 0.55 — 5.5× the "poor" threshold, affecting 70% of them.
-
-CrUX is **not real-time**. It is a 28-day trailing aggregate. It is valuable because it is real users, not because it is current.
-
-### Where PSI does not work
-
-- **Localhost and private hosts** — PSI fetches from Google's infrastructure. Rejected at preflight; use `run_lighthouse`.
-- **Cart, checkout, account pages** — PSI fetches anonymously, so it would measure an empty cart or a login redirect. The plan tool flags these and routes them to `run_lighthouse`, which can carry session cookies.
-- **Low-traffic URLs** — reachable, but with no CrUX data. You get a lab-only audit, labelled as such. Staging and preview deployments are always in this category, which is why PSI is optional for non-production environments and authoritative for hosted ones.
-
-### Chunking and time
-
-PSI is slow and erratic: measured latency on live runs ranged from 10 s to 57 s for the same URL, with occasional hangs and intermittent 500s. Roughly one run in three failed on one origin.
-
-`run_performance_audit` therefore runs in chunks. Each call is bounded by `max_seconds_per_call` (default 150) and returns a `cursor`; keep calling until `complete` is true. Raw reports are written to `output_dir` as they land and merged into `_index.json`, so nothing completed is ever lost.
-
-**Re-run to fill gaps.** Call again with the same pages and no cursor — completed page/strategy pairs are skipped automatically, so only the failures are retried.
-
-### Reading the output
-
-The final call returns an `aggregate` block holding every cross-page number: per-strategy means, universal failures, CWV verdict tallies, lab-versus-field counts, outliers. **Quote those rather than recomputing them.** Two redundancy rules also apply there — a vital failing nearly everywhere with little variation collapses into one systemic finding, and FCP is folded into LCP when both fail on a page.
-
-`docs/psi-report-spec.md` is the full guide to turning that output into a written report.
-
----
-
-## Priority system
-
-| Priority | Meaning | Lighthouse threshold | WCAG level | ESLint / Semgrep |
-|---|---|---|---|---|
-| P1 | Blocker — fix before shipping | Score < 50 | Level A | Semgrep security, ESLint error |
-| P2 | Warning — track before merging | Score 50–79 | Level AA | ESLint warning |
-| P3 | Advisory — log as tech debt | Score 80–89 | Level AAA | — |
-| *(suppressed)* | Passing — not reported | Score ≥ 90 | — | — |
-
-Corroborated findings are promoted one tier above where either tool would place them individually.
-
----
-
-## Project layout
-
-```
-qa-mcp/
-├── src/
-│   ├── index.ts                         # MCP server bootstrap + tool registration
-│   ├── types.ts                         # Shared types (Finding, Priority)
-│   ├── config/
-│   │   └── qa-mcp-baseline.eslint.config.js  # Fallback ESLint config
-│   ├── tools/
-│   │   ├── qaGate.ts                    # Orchestrator — runs all tools, builds report
-│   │   ├── performanceAuditPlan.ts      # plan_performance_audit tool
-│   │   ├── performanceAudit.ts          # run_performance_audit tool
-│   │   ├── lighthouse.ts                # run_lighthouse tool
-│   │   ├── accessibility.ts             # run_accessibility_check tool
-│   │   └── staticAnalysis.ts            # run_static_analysis tool
-│   ├── mappers/
-│   │   ├── correlator.ts                # Cross-tool correlation engine (Rule 1 + 2)
-│   │   ├── defectFormatter.ts           # Raw tool output → Finding objects
-│   │   └── priorityMapper.ts            # Score/severity → P1/P2/P3
-│   └── utils/
-│       ├── reportGenerator.ts           # HTML report builder
-│       ├── shellRunner.ts               # CLI execution with timeout + error handling
-│       ├── httpClient.ts                # HTTP execution with timeout, retry, redaction
-│       ├── psiParser.ts                 # PSI response → lab metrics + CrUX field data
-│       ├── psiAuth.ts                   # API key resolution
-│       ├── sitemapReader.ts             # robots.txt + sitemap discovery
-│       ├── urlClassifier.ts             # URL list → page templates
-│       ├── csvReader.ts                 # URL extraction from a CSV
-│       ├── publicUrl.ts                 # Public reachability + session-gate checks
-│       ├── outputParsers.ts             # JSON parsers for each tool's output
-│       ├── eslintConfigDetector.ts      # Detects project ESLint config
-│       └── toolResponse.ts             # MCP error response helpers
-├── docs/
-│   └── psi-report-spec.md               # How to write the PSI audit report
-├── dist/                                # Compiled output (gitignored)
-├── package.json
-├── tsconfig.json
-└── README.md
-```
-
----
-
-## How to prompt
-
-The shortest working prompts:
+## How to ask for it
 
 ```
 # Full suite
@@ -506,12 +86,63 @@ QA snapshot — https://myapp.com
 QA snapshot — /path/to/my-feature-branch
 ```
 
-Alternative trigger phrases (all invoke `run_qa_gate`):
+These all work too:
 
 ```
 Health check on https://myapp.com
 Is https://myapp.com ready to ship? Code at /path/to/repo
 Any red flags? /path/to/repo
+Run Lighthouse on https://myapp.com for mobile and desktop
+Run an accessibility check on https://myapp.com using the axe runner
+Plan a PageSpeed Insights audit for https://myapp.com
 ```
 
-After the run, Claude will surface the `report_file` path. Open it in your browser for the full visual dashboard.
+`run_qa_gate` returns a `report_file` path — open it in a browser for the
+visual dashboard.
+
+---
+
+## What makes it different from running the CLIs yourself
+
+**Findings, not output.** Every result is a prioritised defect with QA-native
+prose and traceable evidence, not a wall of audit JSON.
+
+**Cross-tool corroboration.** When Lighthouse and pa11y independently flag the
+same accessibility gap, the finding is merged, promoted a tier and marked
+`confidence: "high"`. Two tools agreeing is stronger evidence than either alone.
+
+**Systemic collapse.** One duplicate-id component failing on eleven elements is
+reported as one defect, not eleven.
+[How that works →](docs/manual.md#run_accessibility_check)
+
+**Lab versus field.** A metric that passes in the lab but fails for real users
+means your test environment is not reproducing production — and no local tool
+can detect it. On one real homepage the lab reported a perfect CLS of 0 while
+70% of real users were experiencing a rating of poor.
+[More →](docs/manual.md#what-psi-adds-over-run_lighthouse)
+
+---
+
+## Priority levels
+
+| | Meaning |
+|---|---|
+| **P1** | Blocker — fix before shipping |
+| **P2** | Warning — track before merging |
+| **P3** | Advisory — log as tech debt |
+
+Corroborated and field-confirmed findings are promoted a tier; lab-only
+findings that real users don't experience are demoted.
+[Full mapping →](docs/manual.md#priority-system)
+
+---
+
+## Docs
+
+| | |
+|---|---|
+| [Operating manual](docs/manual.md) | Install, per-tool reference, output shapes, troubleshooting |
+| [PSI report spec](docs/psi-report-spec.md) | How to turn a PSI audit into a written report |
+
+MIT-compatible ISC licence. Issues and PRs welcome at
+[Hiddensound/NFunc_MCP](https://github.com/Hiddensound/NFunc_MCP).
