@@ -13,13 +13,42 @@ export interface A11yDedupeResult {
  * component used everywhere, not N unrelated bugs. At or below it, each
  * element keeps its own line.
  *
- * Set at 10 rather than lower because distinct elements failing the same rule
- * are often still separate fixes: ten duplicate ids on a page are ten ids to
- * rename, and collapsing them hides the list a developer needs. It takes a
- * genuine flood — axe reported 41 aria-allowed-attr failures from one reused
- * component — before the group is more useful than its members.
+ * **Lowered from 10 to 2 in Phase 26.** The original 10 was chosen on the
+ * reasoning that "ten duplicate ids on a page are ten ids to rename, and
+ * collapsing them hides the list a developer needs". That objection turned out
+ * to be about `sample_selectors` being capped at 10, not about collapsing —
+ * the ids are in the evidence either way, and the cap is now generous enough
+ * that nothing is hidden.
+ *
+ * What forced the change was a boundary artifact seen on a live site. Two pages
+ * sharing one WooCommerce sorting component reported the same duplicate-id
+ * defect completely differently: the homepage had 11 instances and collapsed to
+ * a single finding (3 violations total), while a category page had exactly 10
+ * and listed every one (12 violations total). Identical underlying bug, and one
+ * page looked four times worse than the other purely because of which side of
+ * the threshold it fell on. A boundary that distorts cross-page comparison that
+ * badly is in the wrong place.
+ *
+ * Two was chosen over an intermediate value after measuring the alternatives on
+ * one product page: threshold 5 left 22 findings and collapsed nothing (its
+ * duplicate-id group sat at exactly 5), threshold 3 gave 18, and threshold 2
+ * gave 10 — one finding per rule, with every selector attached. At 2 the same
+ * component is reported identically on every page, which is the property that
+ * was actually missing. Three gallery images with no alt text are one template
+ * to fix, not three authoring mistakes.
+ *
+ * The cost is real: two genuinely unrelated defects of the same rule on
+ * different components now merge into one finding. `sample_selectors` makes
+ * that recoverable, and the cross-page rollup in the batch aggregate answers
+ * "shared or page-specific" without depending on this number at all.
  */
-const SYSTEMIC_THRESHOLD = 10;
+const SYSTEMIC_THRESHOLD = 2;
+
+/**
+ * How many selectors a systemic finding carries. Generous on purpose: the whole
+ * objection to collapsing was that it hid the list, so the list has to survive.
+ */
+const MAX_SAMPLE_SELECTORS = 25;
 
 /**
  * Collapses the two ways pa11y over-reports a single defect.
@@ -107,8 +136,11 @@ export function dedupeA11yFindings(findings: Finding[]): A11yDedupeResult {
         distinct_elements: group.length,
         systemic: true,
         sample_selectors: group
-          .slice(0, 10)
+          .slice(0, MAX_SAMPLE_SELECTORS)
           .map((f) => String(f.evidence["selector"] ?? "")),
+        ...(group.length > MAX_SAMPLE_SELECTORS
+          ? { selectors_truncated: group.length - MAX_SAMPLE_SELECTORS }
+          : {}),
       },
     });
   }

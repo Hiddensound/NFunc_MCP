@@ -284,8 +284,16 @@ pa11y at WCAG 2 AA by default, violations only. Returns `url`, `standard`,
 `runners`, `violation_count`, `raw_violation_count`, `findings`.
 
 `raw_violation_count` versus `violation_count` shows the dedup at work: a rule
-failing across many elements collapses into one systemic finding rather than
-one per element.
+failing on more than two elements collapses into one systemic finding carrying
+`distinct_elements` and the full `sample_selectors` list, rather than one line
+per element. Three gallery images with no alt text are one template to fix, not
+three authoring mistakes.
+
+This matters across pages as much as within one. Before the threshold was
+lowered, a homepage with 11 duplicate ids collapsed to a single finding while a
+category page with 10 listed every one — the same component, but one page
+appeared four times worse. Collapsing consistently is what makes per-page counts
+comparable at all.
 
 #### Choosing an accessibility engine
 
