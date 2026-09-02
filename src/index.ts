@@ -7,6 +7,8 @@ import { registerLighthouseTool } from "./tools/lighthouse.js";
 import { registerAccessibilityTool } from "./tools/accessibility.js";
 import { registerStaticAnalysisTool } from "./tools/staticAnalysis.js";
 import { registerQaGateTool } from "./tools/qaGate.js";
+import { registerPerformanceAuditPlanTool } from "./tools/performanceAuditPlan.js";
+import { registerPerformanceAuditTool } from "./tools/performanceAudit.js";
 
 /**
  * Identity comes from package.json rather than being written out here, so the
@@ -53,6 +55,8 @@ registerLighthouseTool(server);
 registerAccessibilityTool(server);
 registerStaticAnalysisTool(server);
 registerQaGateTool(server);
+registerPerformanceAuditPlanTool(server);
+registerPerformanceAuditTool(server);
 
 async function main() {
   const transport = new StdioServerTransport();
