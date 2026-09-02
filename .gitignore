@@ -6,3 +6,5 @@ dist/
 limitations.md
 CLAUDE.md
 psi-reports/
+lighthouse-reports/
+a11y-reports/

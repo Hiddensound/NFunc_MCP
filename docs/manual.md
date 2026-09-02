@@ -10,6 +10,7 @@ tools are and how to ask for them; this covers how to run and interpret them.
 2. [Install and register](#install-and-register)
 3. [`run_qa_gate` reference](#run_qa_gate-reference)
 4. [Individual tool reference](#individual-tool-reference)
+   - [Auditing several URLs at once](#auditing-several-urls-at-once)
 5. [PSI performance audit](#psi-performance-audit)
 6. [Priority system](#priority-system)
 7. [Project layout](#project-layout)
@@ -316,6 +317,77 @@ ESLint config when it finds one, otherwise a QA-focused baseline. Returns
 `path`, `tools_run`, `eslint_config_used`, `issue_count`, `findings`,
 `warnings`.
 
+
+### Auditing several URLs at once
+
+`run_lighthouse` and `run_accessibility_check` both accept three input shapes in
+the same `url` field, and detect which they were given:
+
+| You pass | Detected as |
+|---|---|
+| `https://site.com/page` | a single URL — one report, returned immediately |
+| `https://a.com, https://b.com` (or newline-separated) | a list — batch mode |
+| `./top-pages.csv` | a CSV — the URL column is found by name or by content |
+
+A bare domain gets `https://` assumed, duplicates are dropped, and unparseable
+entries are reported rather than silently skipped. An explicit `urls` array
+works too.
+
+**One URL behaves exactly as before** — same response shape, no batch fields.
+Several URLs switch to batch mode:
+
+- Each call is bounded by `max_seconds_per_call` (default **100 s**, chosen to
+  stay under the 120 s at which Claude Code backgrounds a tool call) and returns
+  a `cursor`. Keep calling until `complete` is true.
+- Every report is written to `output_dir` as it lands — the **raw** Lighthouse
+  LHR, so the individual audits survive — and merged into a running
+  `_index.json`.
+- **Re-run to fill gaps.** Call again with the same input and *no cursor*;
+  completed URL/variant pairs are skipped automatically. `skip_completed: false`
+  forces fresh measurements.
+- The final call adds an `aggregate` block. Quote its numbers rather than
+  recomputing them.
+
+Lighthouse runs **sequentially** in batch mode, unlike the single-URL path.
+Two Chrome instances on one machine contend for CPU, and a performance audit
+whose numbers came from a half-busy machine is not worth having. pa11y still
+runs its engines concurrently — it is not measuring time.
+
+#### What the aggregates tell you
+
+`run_lighthouse` returns per-strategy means, a **per-template rollup** (the same
+classifier the PSI plan tool uses, so twelve product URLs report as "PDP average
+61" rather than as twelve rows), CWV verdict tallies, and outlier detection
+against the median.
+
+`run_accessibility_check` returns something a single-page run cannot: **which
+rules fail across most pages**. A rule failing on 80%+ of pages is marked
+`shared_layout: true` — it lives in the header, footer or base template, so one
+fix clears every page. A rule failing on one page is that page's own bug. On a
+four-page sample, `color-contrast` hit 4/4 while `image-alt` and `link-name` hit
+1/4: two completely different pieces of work, and volume alone cannot separate
+them.
+
+#### Mobile accessibility
+
+`form_factor` on `run_accessibility_check` defaults to `desktop` and accepts
+`mobile` or `both`. Mobile emulates 412×823 at 2× DPR with touch, matching
+`run_lighthouse`'s mobile profile so the two describe the same rendered page.
+
+The viewport genuinely applies — a screenshot from the mobile run measures
+824×23418 against 1280×2418 for the default. **But temper expectations:** on a
+test site, neither htmlcs nor axe reported a single different violation between
+the two viewports, because the rules both engines run here are structural —
+missing labels, duplicate ids, absent alt text — and structure does not change
+with width. It earns its keep on sites whose mobile DOM genuinely differs (a
+hamburger nav, different components rendered), which is common on real commerce
+sites.
+
+For viewport-*dependent* accessibility defects today, `run_lighthouse` with
+`form_factor: "both"` is the stronger tool: it reported `target-size` tagged
+`form_factor_specific: true`, a touch-target failure that exists only on mobile
+and that pa11y did not surface at all.
+
 ---
 
 ## PSI performance audit
@@ -488,6 +560,8 @@ Adjustments:
 │       ├── urlClassifier.ts         # URL list → page templates
 │       ├── csvReader.ts             # URL extraction from CSV
 │       ├── publicUrl.ts             # Reachability + session-gate checks
+│       ├── urlInput.ts              # One URL / list / CSV → URL array
+│       ├── batchState.ts            # Cursor, budget, index merge, gap-fill
 │       ├── eslintConfigDetector.ts
 │       └── toolResponse.ts
 ├── docs/
