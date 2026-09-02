@@ -1,7 +1,7 @@
 {
   "name": "nfunc-mcp",
   "version": "0.3.0",
-  "description": "MCP server for non-functional QA — Lighthouse, pa11y, ESLint, and Semgrep in parallel with cross-tool correlation and HTML reports",
+  "description": "MCP server for non-functional QA — Lighthouse, pa11y, ESLint and Semgrep in parallel with cross-tool correlation, plus PageSpeed Insights audits that compare lab scores against real-user Core Web Vitals from CrUX",
   "main": "dist/index.js",
   "type": "module",
   "bin": {
@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "docs",
     "README.md"
   ],
   "engines": {
@@ -33,7 +34,16 @@
     "performance",
     "non-functional-testing",
     "claude",
-    "ai-tools"
+    "ai-tools",
+    "pagespeed",
+    "pagespeed-insights",
+    "core-web-vitals",
+    "crux",
+    "psi",
+    "web-vitals",
+    "lcp",
+    "cls",
+    "inp"
   ],
   "author": "Ajinkya Kunjir",
   "license": "ISC",
