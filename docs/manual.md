@@ -11,6 +11,7 @@ tools are and how to ask for them; this covers how to run and interpret them.
 3. [`run_qa_gate` reference](#run_qa_gate-reference)
 4. [Individual tool reference](#individual-tool-reference)
    - [Auditing several URLs at once](#auditing-several-urls-at-once)
+   - [Comparing two runs (before vs after)](#comparing-two-runs-before-vs-after)
 5. [PSI performance audit](#psi-performance-audit)
 6. [Priority system](#priority-system)
 7. [Project layout](#project-layout)
@@ -388,6 +389,61 @@ For viewport-*dependent* accessibility defects today, `run_lighthouse` with
 `form_factor_specific: true`, a touch-target failure that exists only on mobile
 and that pa11y did not surface at all.
 
+
+### Comparing two runs (before vs after)
+
+A snapshot answers "what is wrong with this page". A developer about to open a
+PR is asking something else: *did my fix work, and did I break anything?* A
+violation count cannot separate those.
+
+Both tools take `baseline_dir`. Point it at an earlier `output_dir`:
+
+```
+# 1. capture a baseline before touching anything
+Run an accessibility check on http://localhost:3000, save to ./a11y-base
+
+# 2. make the fix, then re-scan against it
+Scan http://localhost:3000 again and compare to ./a11y-base
+```
+
+The response gains a `comparison` block:
+
+```jsonc
+"comparison": {
+  "verdict": "mixed",          // clean | improved | mixed | regression | unchanged
+  "summary": "5 defect(s) fixed, but 1 newly introduced (worst: P2). Total went 6 to 2; the drop is real but incomplete — check newly_introduced before treating this as a clean fix.",
+  "fixed":            [{ "id": "image-alt", "was": "P1", ... }],
+  "still_failing":    [{ "id": "color-contrast", "priority": "P3", ... }],
+  "newly_introduced": [{ "id": "aria-valid-attr-value", "priority": "P2", ... }],
+  "score_changes":    [{ "category": "accessibility", "before": 94, "after": 64, "delta": -30 }]
+}
+```
+
+`newly_introduced` is the half that earns this feature. Measured on a real
+page: adding `alt` text, an `aria-label` and a `<label>` fixed **five P1s** and
+introduced one **P2**, because the `aria-labelledby` also added pointed at an id
+that did not exist. A Lighthouse run against a page given a render-blocking
+script reported `regression` with accessibility **94 → 64** and named all four
+injected defects.
+
+Notes on how it behaves:
+
+- **This works with a single URL**, not only batches. A single-URL run touches
+  disk only when `output_dir` is given, so a one-off check stays a one-off while
+  the same call can seed a baseline.
+- **`localhost` is fully supported** — pa11y and Lighthouse run Chrome on your
+  machine. This is the pre-PR check PSI cannot do.
+- **`baseline_dir` may equal `output_dir`.** The baseline is read before
+  anything is written, so "compare against the last run in here" works.
+- **`skip_completed` flips to `false` when comparing.** Re-measuring is the
+  whole point; skipping completed work would compare a run against itself.
+- **Comparison is per `(url, variant, defect id)`.** Only runs present on both
+  sides are compared — a page that was not re-tested is reported under
+  `not_in_current` rather than counted as fixed, since a defect can only be
+  called fixed if the page was measured again.
+- A defect that changed priority between runs counts as **still failing**, not
+  as fixed-and-reintroduced. It is the same defect on the same element.
+
 ---
 
 ## PSI performance audit
@@ -625,6 +681,13 @@ served origin data.
 
 Its CLI is not on PATH. Install it (see
 [prerequisites](#prerequisites)) or ignore it — the rest of the gate still runs.
+
+### A comparison reports nothing was compared
+
+`baseline_dir` had no index, or it covers different URLs than this run. Check
+`not_in_baseline` and `not_in_current` in the comparison block — only runs
+present on both sides can be compared. Create a baseline by running once with
+`output_dir` set.
 
 ### Lighthouse scores look far worse than expected
 

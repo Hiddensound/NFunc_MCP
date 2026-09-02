@@ -6,6 +6,7 @@ import { runShell, type ShellResult } from "../utils/shellRunner.js";
 import { parseLighthouseJSON, type ParsedLighthouse } from "../utils/outputParsers.js";
 import { extractLabMetrics } from "../utils/psiParser.js";
 import { resolveUrlInputs } from "../utils/urlInput.js";
+import { compareRuns, type DefectRef } from "../mappers/runComparator.js";
 import { classifyUrls } from "../utils/urlClassifier.js";
 import { aggregate, type RunResult } from "../mappers/psiAggregator.js";
 import {
@@ -73,6 +74,15 @@ const inputShape = {
     .describe(
       "Batch mode only. Skip URL/form-factor pairs already in the output " +
         "index (default true), so re-running fills gaps instead of redoing work.",
+    ),
+  baseline_dir: z
+    .string()
+    .optional()
+    .describe(
+      "Compare this run against a previous run's index: which audits were " +
+        "fixed, which still fail, which are newly introduced, and how each " +
+        "category score moved. Point it at an earlier output_dir. May be the " +
+        "same as output_dir; the baseline is read before anything is written.",
     ),
   categories: z.array(z.string()).optional(),
   thresholds: z.record(z.string(), z.number()).optional(),
@@ -171,7 +181,30 @@ interface LighthouseRecord extends BatchRecord {
   lab: ReturnType<typeof extractLabMetrics>;
   finding_count: number;
   p1_count: number;
+  /** Audit id + priority per finding, so a later run can diff against this one. */
+  defects: Array<{ id: string; priority: Finding["priority"]; title: string }>;
   report_file: string;
+}
+
+const auditIdOf = (f: Finding): string => String(f.evidence["audit_id"] ?? f.title);
+
+function toDefects(findings: Finding[]): LighthouseRecord["defects"] {
+  return findings.map((f) => ({ id: auditIdOf(f), priority: f.priority, title: f.title }));
+}
+
+function recordsToDefectRefs(records: LighthouseRecord[]): DefectRef[] {
+  const refs: DefectRef[] = [];
+  for (const record of records) {
+    for (const d of record.defects ?? []) {
+      refs.push({ url: record.url, variant: record.variant, id: d.id, priority: d.priority, title: d.title });
+    }
+  }
+  return refs;
+}
+
+/** Category scores keyed url|variant, for the score-delta half of a comparison. */
+function recordsToScores(records: LighthouseRecord[]): Map<string, Record<string, number>> {
+  return new Map(records.map((r) => [`${r.url}|${r.variant}`, r.scores]));
 }
 
 const text = (payload: unknown) => ({
@@ -207,7 +240,7 @@ export function registerLighthouseTool(server: McpServer) {
     },
     async ({
       url, urls, categories, thresholds, form_factor,
-      output_dir, cursor, max_seconds_per_call, skip_completed,
+      output_dir, cursor, max_seconds_per_call, skip_completed, baseline_dir,
     }) => {
       const requested = form_factor ?? "desktop";
       const factors: FormFactor[] =
@@ -224,6 +257,34 @@ export function registerLighthouseTool(server: McpServer) {
       }
       const warnings = [...resolved.warnings];
 
+      // Read the baseline before anything is written, so baseline_dir may be
+      // the same directory as output_dir.
+      const baselineRecords = baseline_dir
+        ? await readIndex<LighthouseRecord>(resolve(baseline_dir))
+        : null;
+      if (baseline_dir && baselineRecords && baselineRecords.length === 0) {
+        warnings.push(
+          `No previous results found in ${resolve(baseline_dir)} — nothing to compare against. ` +
+            "Run once with output_dir set to create a baseline.",
+        );
+      }
+
+      const compareWith = async (records: LighthouseRecord[]) => {
+        if (!baselineRecords) return undefined;
+        const result = compareRuns(
+          resolve(baseline_dir as string),
+          recordsToDefectRefs(baselineRecords),
+          recordsToDefectRefs(records),
+          {
+            baselineScores: recordsToScores(baselineRecords),
+            currentScores: recordsToScores(records),
+          },
+        );
+        warnings.push(...result.warnings);
+        const { warnings: _dropped, ...rest } = result;
+        return rest;
+      };
+
       // ---- Single URL: unchanged contract ------------------------------
       if (resolved.urls.length === 1) {
         const target = resolved.urls[0];
@@ -239,6 +300,40 @@ export function registerLighthouseTool(server: McpServer) {
             : shellErrorResponse("Lighthouse produced no JSON output", first.result);
         }
 
+        // Per-factor records, so a single-URL run can seed or be compared to a
+        // baseline exactly like a batch one.
+        const singleRecords: LighthouseRecord[] = good.map(({ factor, parsed, raw }) => {
+          const findings = sortFindingsByPriority(buildFindings(parsed, thresholds));
+          return {
+            url: target,
+            variant: factor,
+            scores: parsed.categoryScores,
+            ttfb_ms: parsed.ttfbMs,
+            lab: extractLabMetrics(raw),
+            finding_count: findings.length,
+            p1_count: findings.filter((f) => f.priority === "P1").length,
+            defects: toDefects(findings),
+            report_file: "",
+          };
+        });
+
+        // Only touches disk when asked to: a one-off check stays a one-off.
+        let indexFile: string | undefined;
+        if (output_dir) {
+          const dir = resolve(output_dir);
+          await mkdir(dir, { recursive: true });
+          for (const [i, { factor, raw }] of good.entries()) {
+            const file = `${slugForUrl(target)}_${factor}.json`;
+            singleRecords[i].report_file = file;
+            await writeFile(join(dir, file), raw, "utf8");
+          }
+          indexFile = (await mergeIndex(dir, singleRecords)).indexPath;
+        }
+        const comparison = await compareWith(singleRecords);
+        const persisted = indexFile
+          ? { output_dir: resolve(output_dir as string), index_file: indexFile }
+          : {};
+
         if (factors.length === 1) {
           const { parsed } = good[0];
           return text({
@@ -247,6 +342,8 @@ export function registerLighthouseTool(server: McpServer) {
             scores: parsed.categoryScores,
             ttfb_ms: parsed.ttfbMs,
             findings: sortFindingsByPriority(buildFindings(parsed, thresholds)),
+            ...persisted,
+            ...(comparison ? { comparison } : {}),
             ...(warnings.length ? { warnings } : {}),
           });
         }
@@ -264,6 +361,8 @@ export function registerLighthouseTool(server: McpServer) {
           scores,
           ttfb_ms: ttfb,
           findings: mergeAcrossFactors(good, thresholds),
+          ...persisted,
+          ...(comparison ? { comparison } : {}),
           ...(warnings.length ? { warnings } : {}),
         });
       }
@@ -279,8 +378,10 @@ export function registerLighthouseTool(server: McpServer) {
       const allUnits = resolved.urls.flatMap((u) =>
         factors.map((factor) => ({ url: u, variant: factor })),
       );
+      // When comparing, re-measuring is the point — skipping completed work
+      // would compare a run against itself.
       const { units, skipped } = await filterCompleted(
-        dir, allUnits, skip_completed ?? true, cursor,
+        dir, allUnits, skip_completed ?? !baseline_dir, cursor,
       );
       if (skipped > 0) {
         warnings.push(
@@ -347,6 +448,7 @@ export function registerLighthouseTool(server: McpServer) {
           lab: extractLabMetrics(raw),
           finding_count: findings.length,
           p1_count: findings.filter((f) => f.priority === "P1").length,
+          defects: toDefects(findings),
           report_file: reportFile,
         });
         results.push({
@@ -377,8 +479,10 @@ export function registerLighthouseTool(server: McpServer) {
       }
 
       let aggregateBlock: unknown;
+      let comparison: unknown;
       if (complete) {
         const all = await readIndex<LighthouseRecord>(dir);
+        comparison = await compareWith(all);
         // Group by page template so the rollup says "PDPs average 61" rather
         // than listing twelve product URLs. Same classifier the PSI plan uses.
         const { templates } = classifyUrls(all.map((r) => r.url));
@@ -420,6 +524,7 @@ export function registerLighthouseTool(server: McpServer) {
         results,
         ...(failures.length ? { failures } : {}),
         ...(aggregateBlock ? { aggregate: aggregateBlock } : {}),
+        ...(comparison ? { comparison } : {}),
         ...(complete ? {} : { next_step: "Call run_lighthouse again with this cursor and the same input." }),
         warnings,
       });

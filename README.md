@@ -96,6 +96,7 @@ Run Lighthouse on https://myapp.com for mobile and desktop
 Run Lighthouse on these: https://a.com, https://b.com, https://c.com
 Run an accessibility check on https://myapp.com using the axe runner
 Run an accessibility check on every URL in ./top-pages.csv
+Scan http://localhost:3000 and compare it to ./a11y-baseline
 Plan a PageSpeed Insights audit for https://myapp.com
 ```
 
@@ -124,6 +125,14 @@ elements is reported as one defect, not eleven. And across a set of pages, a
 rule failing on 4 of 4 is flagged as shared-layout — one fix in the header
 clears every page, which is a different job from fixing one page's own bug.
 [How that works →](docs/manual.md#run_accessibility_check)
+
+**Before versus after.** Point either tool at a previous run with
+`baseline_dir` and it reports what you **fixed**, what **still fails**, and what
+you **newly introduced** — plus score deltas. A violation count can't tell those
+apart: on a real test, adding an `aria-label` fixed five P1s and introduced an
+`aria-valid-attr-value` P2, because the `aria-labelledby` pointed at a missing
+id. Works against `localhost`, so it's a pre-PR check.
+[How →](docs/manual.md#comparing-two-runs-before-vs-after)
 
 **Lab versus field.** A metric that passes in the lab but fails for real users
 means your test environment is not reproducing production — and no local tool

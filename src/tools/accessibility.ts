@@ -14,6 +14,7 @@ import { dedupeA11yFindings } from "../mappers/a11yDedupe.js";
 import { sortFindingsByPriority } from "../mappers/priorityMapper.js";
 import type { Finding } from "../types.js";
 import { resolveUrlInputs } from "../utils/urlInput.js";
+import { compareRuns, type DefectRef } from "../mappers/runComparator.js";
 import {
   DEFAULT_MAX_SECONDS_PER_CALL,
   decodeCursor,
@@ -70,6 +71,17 @@ const inputShape = {
   cursor: z.string().optional().describe("Resume token from a previous batch call."),
   max_seconds_per_call: z.number().int().min(30).max(900).optional(),
   skip_completed: z.boolean().optional(),
+  baseline_dir: z
+    .string()
+    .optional()
+    .describe(
+      "Compare this run against a previous run's index and report what was " +
+        "fixed, what still fails, and what is newly introduced. Point it at an " +
+        "earlier output_dir. Answers 'did my fix work, and did I break " +
+        "anything?' — a violation count alone cannot, since a fix that also " +
+        "introduces a defect leaves the total unchanged. May be the same as " +
+        "output_dir; the baseline is read before anything is written.",
+    ),
   standard: z.enum(["WCAG2A", "WCAG2AA", "WCAG2AAA"]).optional(),
   ignore: z.array(z.string()).optional(),
   runner: z
@@ -176,6 +188,30 @@ interface A11yRecord extends BatchRecord {
   raw_violation_count: number;
   p1_count: number;
   rules: string[];
+  /** Rule id + priority per defect, so a later run can diff against this one. */
+  defects: Array<{ id: string; priority: Finding["priority"]; title: string }>;
+  report_file: string;
+}
+
+const ruleIdOf = (f: Finding): string => String(f.evidence["rule_code"] ?? f.title);
+
+function toDefects(findings: Finding[]): A11yRecord["defects"] {
+  return findings.map((f) => ({ id: ruleIdOf(f), priority: f.priority, title: f.title }));
+}
+
+/** Index records → the flat defect list the comparator works on. */
+function recordsToDefectRefs(records: A11yRecord[]): DefectRef[] {
+  const refs: DefectRef[] = [];
+  for (const record of records) {
+    // Older indexes predate `defects` and only carry rule ids; fall back so a
+    // stale baseline degrades to a comparison without priorities rather than
+    // silently comparing nothing.
+    const defects = record.defects ?? record.rules.map((id) => ({ id, priority: "P2" as const, title: id }));
+    for (const d of defects) {
+      refs.push({ url: record.url, variant: record.variant, id: d.id, priority: d.priority, title: d.title });
+    }
+  }
+  return refs;
 }
 
 /**
@@ -279,7 +315,7 @@ export function registerAccessibilityTool(server: McpServer) {
     },
     async ({
       url, urls, standard, ignore, runner, form_factor,
-      output_dir, cursor, max_seconds_per_call, skip_completed,
+      output_dir, cursor, max_seconds_per_call, skip_completed, baseline_dir,
     }) => {
       const resolvedStandard = standard ?? "WCAG2AA";
       const resolvedRunner = runner ?? "htmlcs";
@@ -300,6 +336,27 @@ export function registerAccessibilityTool(server: McpServer) {
       }
       const warnings = [...resolved.warnings];
 
+      // Read the baseline before anything is written, so baseline_dir and
+      // output_dir may be the same directory — "compare against the last run
+      // in here" is the natural way to use this.
+      const baselineRefs = baseline_dir
+        ? recordsToDefectRefs(await readIndex<A11yRecord>(resolve(baseline_dir)))
+        : null;
+      if (baseline_dir && baselineRefs && baselineRefs.length === 0) {
+        warnings.push(
+          `No previous results found in ${resolve(baseline_dir)} — nothing to compare against. ` +
+            "Run once with output_dir set to create a baseline.",
+        );
+      }
+
+      const compareWith = async (records: A11yRecord[]) => {
+        if (!baselineRefs) return undefined;
+        const result = compareRuns(resolve(baseline_dir as string), baselineRefs, recordsToDefectRefs(records), {});
+        warnings.push(...result.warnings);
+        const { warnings: _dropped, ...rest } = result;
+        return rest;
+      };
+
       // ---- Single URL, single viewport: unchanged contract --------------
       if (resolved.urls.length === 1 && factors.length === 1) {
         const target = resolved.urls[0];
@@ -316,6 +373,37 @@ export function registerAccessibilityTool(server: McpServer) {
           };
         }
         if (outcome.partial) warnings.push(outcome.partial);
+
+        const record: A11yRecord = {
+          url: target,
+          variant: factors[0],
+          violation_count: outcome.findings.length,
+          raw_violation_count: outcome.rawCount,
+          p1_count: outcome.findings.filter((f) => f.priority === "P1").length,
+          rules: [...new Set(outcome.findings.map(ruleIdOf))],
+          defects: toDefects(outcome.findings),
+          report_file: "",
+        };
+
+        // A single URL only touches disk when asked to. That keeps the
+        // original contract for a one-off check, while making the same call
+        // usable as a baseline for the next one.
+        let indexFile: string | undefined;
+        if (output_dir) {
+          const dir = resolve(output_dir);
+          await mkdir(dir, { recursive: true });
+          record.report_file = `${slugForUrl(target)}_${factors[0]}.json`;
+          await writeFile(
+            join(dir, record.report_file),
+            JSON.stringify({ url: target, form_factor: factors[0], standard: resolvedStandard,
+              runners: engines, violation_count: outcome.findings.length,
+              raw_violation_count: outcome.rawCount, findings: outcome.findings }, null, 2),
+            "utf8",
+          );
+          indexFile = (await mergeIndex(dir, [record])).indexPath;
+        }
+
+        const comparison = await compareWith([record]);
         return text({
           url: target,
           standard: resolvedStandard,
@@ -326,6 +414,8 @@ export function registerAccessibilityTool(server: McpServer) {
           // rather than looking like dropped findings.
           raw_violation_count: outcome.rawCount,
           findings: outcome.findings,
+          ...(indexFile ? { output_dir: resolve(output_dir as string), index_file: indexFile } : {}),
+          ...(comparison ? { comparison } : {}),
           ...(warnings.length ? { warnings } : {}),
         });
       }
@@ -339,8 +429,10 @@ export function registerAccessibilityTool(server: McpServer) {
       const allUnits = resolved.urls.flatMap((u) =>
         factors.map((factor) => ({ url: u, variant: factor })),
       );
+      // When comparing, re-measuring is the whole point — skipping completed
+      // work would silently compare a run against itself.
       const { units, skipped } = await filterCompleted(
-        dir, allUnits, skip_completed ?? true, cursor,
+        dir, allUnits, skip_completed ?? !baseline_dir, cursor,
       );
       if (skipped > 0) {
         warnings.push(
@@ -415,6 +507,7 @@ export function registerAccessibilityTool(server: McpServer) {
           raw_violation_count: outcome.rawCount,
           p1_count: outcome.findings.filter((f) => f.priority === "P1").length,
           rules,
+          defects: toDefects(outcome.findings),
           report_file: reportFile,
         });
         results.push({
@@ -445,8 +538,11 @@ export function registerAccessibilityTool(server: McpServer) {
       }
 
       let aggregateBlock: unknown;
+      let comparison: unknown;
       if (complete) {
-        aggregateBlock = aggregateA11y(await readIndex<A11yRecord>(dir));
+        const all = await readIndex<A11yRecord>(dir);
+        aggregateBlock = aggregateA11y(all);
+        comparison = await compareWith(all);
       }
 
       return text({
@@ -463,6 +559,7 @@ export function registerAccessibilityTool(server: McpServer) {
         results,
         ...(failures.length ? { failures } : {}),
         ...(aggregateBlock ? { aggregate: aggregateBlock } : {}),
+        ...(comparison ? { comparison } : {}),
         ...(complete ? {} : { next_step: "Call run_accessibility_check again with this cursor and the same input." }),
         warnings,
       });
