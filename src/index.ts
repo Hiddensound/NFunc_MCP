@@ -9,6 +9,8 @@ import { registerStaticAnalysisTool } from "./tools/staticAnalysis.js";
 import { registerQaGateTool } from "./tools/qaGate.js";
 import { registerPerformanceAuditPlanTool } from "./tools/performanceAuditPlan.js";
 import { registerPerformanceAuditTool } from "./tools/performanceAudit.js";
+import { redactAll } from "./utils/httpClient.js";
+import { KEY_ENV_VAR } from "./utils/psiAuth.js";
 
 /**
  * Identity comes from package.json rather than being written out here, so the
@@ -63,7 +65,19 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error("qa-mcp fatal error:", err);
+/**
+ * A bootstrap failure cannot be reported over the transport — the transport is
+ * what failed — so it goes to stderr, where the MCP client surfaces it in its
+ * own logs. Nothing here has made an HTTP request yet, so a PSI key should not
+ * be in the error; it goes through `redactAll` anyway because this is the one
+ * path that prints an error the request plumbing never saw, and a log file is
+ * exactly the wrong place to discover a key later.
+ */
+main().catch((err: unknown) => {
+  const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+  console.error(
+    "qa-mcp fatal error:",
+    redactAll(detail, [process.env[KEY_ENV_VAR] ?? ""]),
+  );
   process.exit(1);
 });

@@ -99,7 +99,16 @@ export function sanitizeUrl(url: string | URL): string {
   }
 }
 
-function redactAll(message: string, secrets: string[]): string {
+/**
+ * Strip literal secret values out of a message before it is shown anywhere.
+ *
+ * `sanitizeUrl` handles the case where the key sits in a query parameter we
+ * can name; this handles the rest — a key echoed back inside a provider's
+ * error body, or a stack frame that captured it as an argument. Exported so
+ * the bootstrap fatal handler can use it too, since that error is printed
+ * before any of the request plumbing has had a chance to redact it.
+ */
+export function redactAll(message: string, secrets: string[]): string {
   let out = message;
   for (const secret of secrets) {
     // A short "secret" would redact half the message; a real key is far longer.
