@@ -52,8 +52,8 @@ Verify with `/mcp`, then ask Claude to *"call the nfunc-mcp ping tool."*
 | Tool | What it does |
 |---|---|
 | **`run_qa_gate`** | **The one to reach for.** Runs everything applicable in parallel, correlates findings across tools, and returns a release verdict, a composite score, a per-tool scorecard and an HTML report. |
-| `run_lighthouse` | Lighthouse for a URL. `form_factor: "both"` finds device-specific defects the single profiles miss. |
-| `run_accessibility_check` | pa11y WCAG audit. `runner: "axe"` for ARIA and design systems; `"both"` for the widest sweep. |
+| `run_lighthouse` | Lighthouse for **one URL, a list, or a CSV**. `form_factor: "both"` finds device-specific defects the single profiles miss. |
+| `run_accessibility_check` | pa11y WCAG audit for **one URL, a list, or a CSV**. Findings are priced by **WCAG 2.1 conformance** — Level A failures are P1 because they put an AA claim out of reach. `runner: "axe"` for ARIA and design systems. |
 | `run_static_analysis` | ESLint + Semgrep over a local codebase. Uses your ESLint config if it finds one. |
 | `plan_performance_audit` | Plans a PageSpeed Insights audit — finds your URLs, groups them into page templates, costs the run. **Spends no quota.** |
 | `run_performance_audit` | Runs it. Lab scores, real-user field data, and the disagreements between them. |
@@ -93,7 +93,10 @@ Health check on https://myapp.com
 Is https://myapp.com ready to ship? Code at /path/to/repo
 Any red flags? /path/to/repo
 Run Lighthouse on https://myapp.com for mobile and desktop
+Run Lighthouse on these: https://a.com, https://b.com, https://c.com
 Run an accessibility check on https://myapp.com using the axe runner
+Run an accessibility check on every URL in ./top-pages.csv
+Scan http://localhost:3000 and compare it to ./a11y-baseline
 Plan a PageSpeed Insights audit for https://myapp.com
 ```
 
@@ -111,9 +114,34 @@ prose and traceable evidence, not a wall of audit JSON.
 same accessibility gap, the finding is merged, promoted a tier and marked
 `confidence: "high"`. Two tools agreeing is stronger evidence than either alone.
 
-**Systemic collapse.** One duplicate-id component failing on eleven elements is
-reported as one defect, not eleven.
+**Hand it a list, not a URL.** `run_lighthouse` and `run_accessibility_check`
+both take a single URL, a comma-separated list, or a path to a CSV — and work
+out which you gave them. Multiple URLs run as a resumable batch that writes each
+report to disk and finishes with a cross-page rollup.
+[How batching works →](docs/manual.md#auditing-several-urls-at-once)
+
+**Systemic collapse, twice over.** One duplicate-id component failing on eleven
+elements is reported as one defect, not eleven. And across a set of pages, a
+rule failing on 4 of 4 is flagged as shared-layout — one fix in the header
+clears every page, which is a different job from fixing one page's own bug.
 [How that works →](docs/manual.md#run_accessibility_check)
+
+**WCAG conformance, not a violation count.** Every accessibility finding maps
+to a WCAG 2.1 success criterion and says what it costs your claim. A Level A
+failure is P1 — not because it feels worse, but because while it stands, Level
+AA conformance is *unreachable* no matter how the other criteria score. Each run
+returns a conformance verdict counting failing **criteria**, not findings: "22
+issues" and "5 criteria failing" are answers to different questions, and only
+one of them goes in a compliance statement.
+[How →](docs/manual.md#wcag-conformance-and-priority)
+
+**Before versus after.** Point either tool at a previous run with
+`baseline_dir` and it reports what you **fixed**, what **still fails**, and what
+you **newly introduced** — plus score deltas. A violation count can't tell those
+apart: on a real test, adding an `aria-label` fixed five P1s and introduced an
+`aria-valid-attr-value` P2, because the `aria-labelledby` pointed at a missing
+id. Works against `localhost`, so it's a pre-PR check.
+[How →](docs/manual.md#comparing-two-runs-before-vs-after)
 
 **Lab versus field.** A metric that passes in the lab but fails for real users
 means your test environment is not reproducing production — and no local tool

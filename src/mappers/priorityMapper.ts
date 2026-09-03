@@ -1,4 +1,9 @@
 import type { Finding, Priority } from "../types.js";
+import {
+  isRequiredFor,
+  type TargetLevel,
+  type WcagConformanceLevel,
+} from "./wcagLevels.js";
 
 export type { Priority };
 
@@ -174,4 +179,73 @@ export function sortFindingsByPriority<T extends Finding>(findings: T[]): T[] {
   return findings.sort(
     (a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority],
   );
+}
+
+
+const DEMOTE: Record<Priority, Priority> = { P1: "P2", P2: "P3", P3: "P3" };
+
+export interface ConformancePriority {
+  priority: Priority | null;
+  /** True when this failure prevents conformance at the committed target. */
+  blocksTarget: boolean;
+}
+
+/**
+ * Priority from WCAG conformance rather than from a technique table.
+ *
+ * The levels are cumulative: claiming AA requires meeting every Level A
+ * criterion as well, so a Level A failure is not merely "one more issue" — it
+ * puts the committed target out of reach entirely until it is fixed. A page
+ * with three Level A failures cannot be AA conformant no matter how clean its
+ * AA-specific criteria are, and the priority scheme should say so.
+ *
+ *   Level A failure   → P1   blocks the floor; conformance impossible
+ *   Level AA failure  → P2   blocks an AA commitment
+ *   Above the target  → P3   an enhancement, not a gap (see below)
+ *   No criterion      → P3   best-practice rule; never blocks a release
+ *
+ * This replaces the Phase 13 technique table, which ranked findings by how bad
+ * the defect felt rather than by what it does to a conformance claim. That
+ * table existed because mapping level → priority naively made almost everything
+ * P1; the answer here is not to flatten the levels but to report the count of
+ * *distinct failing criteria* alongside, so "7 findings" reads as "5 Level A
+ * criteria failing" instead of an undifferentiated wall of P1s.
+ *
+ * Criteria above the target are deliberately not failures. Orium's checklist
+ * makes the same point: AAA findings against an AA commitment are enhancement
+ * opportunities, and counting them as gaps overstates the compliance position.
+ * `target_size` is the one that bites in practice — it is 2.5.5, Level AAA in
+ * WCAG 2.1, so it should not fail an AA audit.
+ *
+ * Two demotions apply afterwards. axe's `needsFurtherReview` marks a rule that
+ * could not decide on its own, and a maybe should not gate a release as hard as
+ * a certainty. An axe impact of `minor` marks a real but negligible defect —
+ * the "very minor AA issue" tier.
+ */
+export function wcagConformanceToPriority(
+  level: WcagConformanceLevel | "unknown",
+  target: TargetLevel,
+  options: { axeImpact?: string; needsReview?: boolean } = {},
+): ConformancePriority {
+  if (level === "unknown") {
+    return { priority: "P3", blocksTarget: false };
+  }
+
+  const blocksTarget = isRequiredFor(level, target);
+  let priority: Priority;
+
+  if (!blocksTarget) {
+    priority = "P3"; // beyond the committed level
+  } else if (level === "A") {
+    priority = "P1";
+  } else if (level === "AA") {
+    priority = "P2";
+  } else {
+    priority = "P2"; // AAA, only when AAA is the committed target
+  }
+
+  if (options.needsReview) priority = DEMOTE[priority];
+  if (options.axeImpact === "minor") priority = DEMOTE[priority];
+
+  return { priority, blocksTarget };
 }

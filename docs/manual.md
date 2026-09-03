@@ -10,6 +10,8 @@ tools are and how to ask for them; this covers how to run and interpret them.
 2. [Install and register](#install-and-register)
 3. [`run_qa_gate` reference](#run_qa_gate-reference)
 4. [Individual tool reference](#individual-tool-reference)
+   - [Auditing several URLs at once](#auditing-several-urls-at-once)
+   - [Comparing two runs (before vs after)](#comparing-two-runs-before-vs-after)
 5. [PSI performance audit](#psi-performance-audit)
 6. [Priority system](#priority-system)
 7. [Project layout](#project-layout)
@@ -282,8 +284,71 @@ pa11y at WCAG 2 AA by default, violations only. Returns `url`, `standard`,
 `runners`, `violation_count`, `raw_violation_count`, `findings`.
 
 `raw_violation_count` versus `violation_count` shows the dedup at work: a rule
-failing across many elements collapses into one systemic finding rather than
-one per element.
+failing on more than two elements collapses into one systemic finding carrying
+`distinct_elements` and the full `sample_selectors` list, rather than one line
+per element. Three gallery images with no alt text are one template to fix, not
+three authoring mistakes.
+
+This matters across pages as much as within one. Before the threshold was
+lowered, a homepage with 11 duplicate ids collapsed to a single finding while a
+category page with 10 listed every one — the same component, but one page
+appeared four times worse. Collapsing consistently is what makes per-page counts
+comparable at all.
+
+#### WCAG conformance and priority
+
+Findings are priced by what they cost a **conformance claim**, not by how bad
+the defect feels. `target_level` names the level the project has committed to —
+default `AA`, the legal and industry bar for essentially all commercial work.
+
+| Finding | Priority | Why |
+|---|---|---|
+| Level **A** criterion fails | **P1** | The floor. While any Level A criterion fails, no higher level is achievable — AA conformance is impossible regardless of how the AA-specific criteria score |
+| Level **AA** criterion fails | **P2** | Blocks an AA commitment |
+| Criterion **above** the target | **P3** | An enhancement, not a gap. `target-size` is 2.5.5, Level **AAA** in WCAG 2.1 — it should not fail an AA audit |
+| Not a success criterion | **P3** | A best-practice rule. Worth fixing; does not affect a conformance claim |
+
+Two demotions apply after that: axe's `needsFurtherReview` (a maybe should not
+gate a release as hard as a certainty) and an axe impact of `minor` — the "very
+minor AA issue" tier.
+
+Every finding carries `wcag_criterion`, `wcag_name`, `wcag_level` and
+`blocks_target` in its evidence, and its description states what the failure
+means for the claim.
+
+Each run also returns a `conformance` block, and a batch adds a cross-page
+rollup:
+
+```jsonc
+"conformance": {
+  "target_level": "AA",
+  "conformant": false,
+  "failing_criteria": { "A": 6, "AA": 1, "AAA": 0 },
+  "beyond_target": 0,
+  "failed_criteria": [
+    { "criterion": "4.1.1", "name": "Parsing", "level": "A", "findings": 5, "blocks_target": true }
+  ],
+  "summary": "Not Level AA conformant. 6 Level A criteria fail... Level A is the floor..."
+}
+```
+
+**The unit is the criterion, not the finding.** Twelve findings against one
+criterion is one thing to fix and one line in a conformance statement. The
+finding count answers "how much work"; the criterion count answers "are we
+conformant". A report giving only the first is how a page ends up described as
+having 22 accessibility issues when it fails five criteria.
+
+Criterion levels are transcribed from
+[WCAG 2.1](https://www.w3.org/TR/WCAG21/). htmlcs encodes the criterion in its
+rule code; axe does not expose WCAG tags through pa11y, so its rule ids go
+through a lookup table in `src/mappers/wcagLevels.ts`. Rules axe classifies as
+best-practice map to no criterion deliberately — reporting one as a conformance
+failure would overstate the legal position.
+
+**Automated testing reaches roughly a third of WCAG criteria.** A `conformant:
+true` result means nothing automated failed, not that the page conforms. Focus
+order, keyboard traps, meaningful sequence, error suggestion and content on
+hover all need a human.
 
 #### Choosing an accessibility engine
 
@@ -315,6 +380,132 @@ ESLint and Semgrep in parallel against a local directory. Uses the project's own
 ESLint config when it finds one, otherwise a QA-focused baseline. Returns
 `path`, `tools_run`, `eslint_config_used`, `issue_count`, `findings`,
 `warnings`.
+
+
+### Auditing several URLs at once
+
+`run_lighthouse` and `run_accessibility_check` both accept three input shapes in
+the same `url` field, and detect which they were given:
+
+| You pass | Detected as |
+|---|---|
+| `https://site.com/page` | a single URL — one report, returned immediately |
+| `https://a.com, https://b.com` (or newline-separated) | a list — batch mode |
+| `./top-pages.csv` | a CSV — the URL column is found by name or by content |
+
+A bare domain gets `https://` assumed, duplicates are dropped, and unparseable
+entries are reported rather than silently skipped. An explicit `urls` array
+works too.
+
+**One URL behaves exactly as before** — same response shape, no batch fields.
+Several URLs switch to batch mode:
+
+- Each call is bounded by `max_seconds_per_call` (default **100 s**, chosen to
+  stay under the 120 s at which Claude Code backgrounds a tool call) and returns
+  a `cursor`. Keep calling until `complete` is true.
+- Every report is written to `output_dir` as it lands — the **raw** Lighthouse
+  LHR, so the individual audits survive — and merged into a running
+  `_index.json`.
+- **Re-run to fill gaps.** Call again with the same input and *no cursor*;
+  completed URL/variant pairs are skipped automatically. `skip_completed: false`
+  forces fresh measurements.
+- The final call adds an `aggregate` block. Quote its numbers rather than
+  recomputing them.
+
+Lighthouse runs **sequentially** in batch mode, unlike the single-URL path.
+Two Chrome instances on one machine contend for CPU, and a performance audit
+whose numbers came from a half-busy machine is not worth having. pa11y still
+runs its engines concurrently — it is not measuring time.
+
+#### What the aggregates tell you
+
+`run_lighthouse` returns per-strategy means, a **per-template rollup** (the same
+classifier the PSI plan tool uses, so twelve product URLs report as "PDP average
+61" rather than as twelve rows), CWV verdict tallies, and outlier detection
+against the median.
+
+`run_accessibility_check` returns something a single-page run cannot: **which
+rules fail across most pages**. A rule failing on 80%+ of pages is marked
+`shared_layout: true` — it lives in the header, footer or base template, so one
+fix clears every page. A rule failing on one page is that page's own bug. On a
+four-page sample, `color-contrast` hit 4/4 while `image-alt` and `link-name` hit
+1/4: two completely different pieces of work, and volume alone cannot separate
+them.
+
+#### Mobile accessibility
+
+`form_factor` on `run_accessibility_check` defaults to `desktop` and accepts
+`mobile` or `both`. Mobile emulates 412×823 at 2× DPR with touch, matching
+`run_lighthouse`'s mobile profile so the two describe the same rendered page.
+
+The viewport genuinely applies — a screenshot from the mobile run measures
+824×23418 against 1280×2418 for the default. **But temper expectations:** on a
+test site, neither htmlcs nor axe reported a single different violation between
+the two viewports, because the rules both engines run here are structural —
+missing labels, duplicate ids, absent alt text — and structure does not change
+with width. It earns its keep on sites whose mobile DOM genuinely differs (a
+hamburger nav, different components rendered), which is common on real commerce
+sites.
+
+For viewport-*dependent* accessibility defects today, `run_lighthouse` with
+`form_factor: "both"` is the stronger tool: it reported `target-size` tagged
+`form_factor_specific: true`, a touch-target failure that exists only on mobile
+and that pa11y did not surface at all.
+
+
+### Comparing two runs (before vs after)
+
+A snapshot answers "what is wrong with this page". A developer about to open a
+PR is asking something else: *did my fix work, and did I break anything?* A
+violation count cannot separate those.
+
+Both tools take `baseline_dir`. Point it at an earlier `output_dir`:
+
+```
+# 1. capture a baseline before touching anything
+Run an accessibility check on http://localhost:3000, save to ./a11y-base
+
+# 2. make the fix, then re-scan against it
+Scan http://localhost:3000 again and compare to ./a11y-base
+```
+
+The response gains a `comparison` block:
+
+```jsonc
+"comparison": {
+  "verdict": "mixed",          // clean | improved | mixed | regression | unchanged
+  "summary": "5 defect(s) fixed, but 1 newly introduced (worst: P2). Total went 6 to 2; the drop is real but incomplete — check newly_introduced before treating this as a clean fix.",
+  "fixed":            [{ "id": "image-alt", "was": "P1", ... }],
+  "still_failing":    [{ "id": "color-contrast", "priority": "P3", ... }],
+  "newly_introduced": [{ "id": "aria-valid-attr-value", "priority": "P2", ... }],
+  "score_changes":    [{ "category": "accessibility", "before": 94, "after": 64, "delta": -30 }]
+}
+```
+
+`newly_introduced` is the half that earns this feature. Measured on a real
+page: adding `alt` text, an `aria-label` and a `<label>` fixed **five P1s** and
+introduced one **P2**, because the `aria-labelledby` also added pointed at an id
+that did not exist. A Lighthouse run against a page given a render-blocking
+script reported `regression` with accessibility **94 → 64** and named all four
+injected defects.
+
+Notes on how it behaves:
+
+- **This works with a single URL**, not only batches. A single-URL run touches
+  disk only when `output_dir` is given, so a one-off check stays a one-off while
+  the same call can seed a baseline.
+- **`localhost` is fully supported** — pa11y and Lighthouse run Chrome on your
+  machine. This is the pre-PR check PSI cannot do.
+- **`baseline_dir` may equal `output_dir`.** The baseline is read before
+  anything is written, so "compare against the last run in here" works.
+- **`skip_completed` flips to `false` when comparing.** Re-measuring is the
+  whole point; skipping completed work would compare a run against itself.
+- **Comparison is per `(url, variant, defect id)`.** Only runs present on both
+  sides are compared — a page that was not re-tested is reported under
+  `not_in_current` rather than counted as fixed, since a defect can only be
+  called fixed if the page was measured again.
+- A defect that changed priority between runs counts as **still failing**, not
+  as fixed-and-reintroduced. It is the same defect on the same element.
 
 ---
 
@@ -434,9 +625,9 @@ output into a written report.
 
 | Priority | Meaning | Lighthouse | WCAG | ESLint / Semgrep | CrUX field |
 |---|---|---|---|---|---|
-| P1 | Blocker — fix before shipping | Score < 50 | Level A | Semgrep security, ESLint error | Core vital rated poor |
-| P2 | Warning — track before merging | 50–79 | Level AA | ESLint warning | Needs improvement, or any diagnostic |
-| P3 | Advisory — log as tech debt | 80–89 | Level AAA | — | — |
+| P1 | Blocker — fix before shipping | Score < 50 | **Level A failure** — puts the target out of reach | Semgrep security, ESLint error | Core vital rated poor |
+| P2 | Warning — track before merging | 50–79 | **Level AA failure** | ESLint warning | Needs improvement, or any diagnostic |
+| P3 | Advisory — log as tech debt | 80–89 | **Above the target**, or a best-practice rule | — | — |
 | *(suppressed)* | Passing — never reported | ≥ 90 | — | — | Good |
 
 Lighthouse findings are actually ranked by `weight × (1 − score)` — the category
@@ -488,6 +679,8 @@ Adjustments:
 │       ├── urlClassifier.ts         # URL list → page templates
 │       ├── csvReader.ts             # URL extraction from CSV
 │       ├── publicUrl.ts             # Reachability + session-gate checks
+│       ├── urlInput.ts              # One URL / list / CSV → URL array
+│       ├── batchState.ts            # Cursor, budget, index merge, gap-fill
 │       ├── eslintConfigDetector.ts
 │       └── toolResponse.ts
 ├── docs/
@@ -551,6 +744,13 @@ served origin data.
 
 Its CLI is not on PATH. Install it (see
 [prerequisites](#prerequisites)) or ignore it — the rest of the gate still runs.
+
+### A comparison reports nothing was compared
+
+`baseline_dir` had no index, or it covers different URLs than this run. Check
+`not_in_baseline` and `not_in_current` in the comparison block — only runs
+present on both sides can be compared. Create a baseline by running once with
+`output_dir` set.
 
 ### Lighthouse scores look far worse than expected
 

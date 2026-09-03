@@ -251,7 +251,7 @@ export function parseCrux(
  * Formatting is a report-time concern; nothing upstream of the report should
  * hold a number as text.
  */
-function parseLabMetrics(auditsJson: string): LabMetrics {
+export function extractLabMetrics(auditsJson: string): LabMetrics {
   const audits = JSON.parse(auditsJson) as {
     audits?: Record<string, { numericValue?: number }>;
   };
@@ -326,7 +326,7 @@ export function parsePsiResponse(
     fetchTime: lhr.fetchTime ?? null,
     lighthouseVersion: lhr.lighthouseVersion ?? null,
     scores: lighthouse.categoryScores,
-    lab: parseLabMetrics(lhrJson),
+    lab: extractLabMetrics(lhrJson),
     field: parseCrux(
       response.loadingExperience,
       response.originLoadingExperience,
