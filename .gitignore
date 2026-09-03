@@ -5,6 +5,7 @@ dist/
 .DS_Store
 limitations.md
 CLAUDE.md
+performance-audit-plan.md
 psi-reports/
 lighthouse-reports/
 a11y-reports/
