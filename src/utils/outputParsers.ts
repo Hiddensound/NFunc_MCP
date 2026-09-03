@@ -1,3 +1,5 @@
+import { criterionFor } from "../mappers/wcagLevels.js";
+
 export interface LighthouseAuditRef {
   id: string;
   title: string;
@@ -204,28 +206,23 @@ const WCAG_CRITERION_LEVELS: Record<string, WcagLevel> = {
   "4.1.3": "AA",
 };
 
-function deriveWcagLevel(code: string): {
-  level: WcagLevel;
-  criterion: string | null;
-} {
-  // pa11y/HTMLCS code shape: WCAG2AA.Principle1.Guideline1_1.1_1_1.H37
-  const segments = code.split(".");
-  let criterion: string | null = null;
-  for (const seg of segments) {
-    if (/^\d+(_\d+)+$/.test(seg)) {
-      criterion = seg.replace(/_/g, ".");
-      break;
-    }
-  }
-  if (criterion && WCAG_CRITERION_LEVELS[criterion]) {
-    return { level: WCAG_CRITERION_LEVELS[criterion], criterion };
-  }
-  // Fallback: infer from standard prefix when criterion is unknown.
-  const prefix = segments[0] ?? "";
-  if (prefix === "WCAG2AAA") return { level: "AAA", criterion };
-  if (prefix === "WCAG2AA") return { level: "AA", criterion };
-  if (prefix === "WCAG2A") return { level: "A", criterion };
-  return { level: "unknown", criterion };
+/**
+ * Resolve a finding to its WCAG success criterion and level.
+ *
+ * Both engines are handled here now. htmlcs encodes the criterion in its code;
+ * axe does not expose WCAG tags through pa11y at all, so its rule ids go
+ * through a lookup table. The previous implementation inferred the level from
+ * the code's "WCAG2AA" prefix when the criterion was unknown — but that prefix
+ * names the *standard being tested against*, not the criterion's own level, so
+ * it labelled everything AA and made a level-based priority scheme impossible.
+ */
+function deriveWcagLevel(
+  code: string,
+  runner: A11yRunner,
+): { level: WcagLevel; criterion: string | null } {
+  const found = criterionFor(code, runner);
+  if (found) return { level: found.level, criterion: found.number };
+  return { level: "unknown", criterion: null };
 }
 
 function isAxeImpact(v: string | undefined): v is AxeImpact {
@@ -350,12 +347,14 @@ export function parsePa11yJSON(rawJson: string): ParsedPa11y {
     const runner: A11yRunner = issue.runner === "axe" ? "axe" : "htmlcs";
 
     if (runner === "axe") {
-      // axe codes are bare rule ids with no WCAG path to parse, so the
-      // criterion-derivation below cannot classify them — it would return
-      // level "unknown", which the priority mapper drops. Severity comes from
-      // axe's own impact rating instead. (Skipping this branch silently
-      // discarded every axe finding.)
+      // axe codes are bare rule ids with no WCAG path in them, so they go
+      // through the rule → criterion table rather than the code parser. This
+      // branch used to hardcode level "unknown" because that table did not
+      // exist; leaving it that way after adding the table made every axe
+      // finding read as a best-practice nit, including image-alt and
+      // color-contrast, which are 1.1.1 (A) and 1.4.3 (AA).
       const impact = issue.runnerExtras?.impact;
+      const axeCriterion = deriveWcagLevel(code, runner);
       violations.push({
         code,
         technique: code,
@@ -363,8 +362,8 @@ export function parsePa11yJSON(rawJson: string): ParsedPa11y {
         selector: issue.selector ?? "",
         context: issue.context ?? "",
         type,
-        wcagLevel: "unknown",
-        criterion: null,
+        wcagLevel: axeCriterion.level,
+        criterion: axeCriterion.criterion,
         runner,
         impact: isAxeImpact(impact) ? impact : undefined,
         needsReview: issue.runnerExtras?.needsFurtherReview === true,
@@ -372,7 +371,7 @@ export function parsePa11yJSON(rawJson: string): ParsedPa11y {
       continue;
     }
 
-    const { level, criterion } = deriveWcagLevel(code);
+    const { level, criterion } = deriveWcagLevel(code, runner);
     violations.push({
       code,
       technique: extractTechnique(code),

@@ -295,6 +295,61 @@ category page with 10 listed every one — the same component, but one page
 appeared four times worse. Collapsing consistently is what makes per-page counts
 comparable at all.
 
+#### WCAG conformance and priority
+
+Findings are priced by what they cost a **conformance claim**, not by how bad
+the defect feels. `target_level` names the level the project has committed to —
+default `AA`, the legal and industry bar for essentially all commercial work.
+
+| Finding | Priority | Why |
+|---|---|---|
+| Level **A** criterion fails | **P1** | The floor. While any Level A criterion fails, no higher level is achievable — AA conformance is impossible regardless of how the AA-specific criteria score |
+| Level **AA** criterion fails | **P2** | Blocks an AA commitment |
+| Criterion **above** the target | **P3** | An enhancement, not a gap. `target-size` is 2.5.5, Level **AAA** in WCAG 2.1 — it should not fail an AA audit |
+| Not a success criterion | **P3** | A best-practice rule. Worth fixing; does not affect a conformance claim |
+
+Two demotions apply after that: axe's `needsFurtherReview` (a maybe should not
+gate a release as hard as a certainty) and an axe impact of `minor` — the "very
+minor AA issue" tier.
+
+Every finding carries `wcag_criterion`, `wcag_name`, `wcag_level` and
+`blocks_target` in its evidence, and its description states what the failure
+means for the claim.
+
+Each run also returns a `conformance` block, and a batch adds a cross-page
+rollup:
+
+```jsonc
+"conformance": {
+  "target_level": "AA",
+  "conformant": false,
+  "failing_criteria": { "A": 6, "AA": 1, "AAA": 0 },
+  "beyond_target": 0,
+  "failed_criteria": [
+    { "criterion": "4.1.1", "name": "Parsing", "level": "A", "findings": 5, "blocks_target": true }
+  ],
+  "summary": "Not Level AA conformant. 6 Level A criteria fail... Level A is the floor..."
+}
+```
+
+**The unit is the criterion, not the finding.** Twelve findings against one
+criterion is one thing to fix and one line in a conformance statement. The
+finding count answers "how much work"; the criterion count answers "are we
+conformant". A report giving only the first is how a page ends up described as
+having 22 accessibility issues when it fails five criteria.
+
+Criterion levels are transcribed from
+[WCAG 2.1](https://www.w3.org/TR/WCAG21/). htmlcs encodes the criterion in its
+rule code; axe does not expose WCAG tags through pa11y, so its rule ids go
+through a lookup table in `src/mappers/wcagLevels.ts`. Rules axe classifies as
+best-practice map to no criterion deliberately — reporting one as a conformance
+failure would overstate the legal position.
+
+**Automated testing reaches roughly a third of WCAG criteria.** A `conformant:
+true` result means nothing automated failed, not that the page conforms. Focus
+order, keyboard traps, meaningful sequence, error suggestion and content on
+hover all need a human.
+
 #### Choosing an accessibility engine
 
 | Engine | Strongest at | Severity source |
@@ -570,9 +625,9 @@ output into a written report.
 
 | Priority | Meaning | Lighthouse | WCAG | ESLint / Semgrep | CrUX field |
 |---|---|---|---|---|---|
-| P1 | Blocker — fix before shipping | Score < 50 | Level A | Semgrep security, ESLint error | Core vital rated poor |
-| P2 | Warning — track before merging | 50–79 | Level AA | ESLint warning | Needs improvement, or any diagnostic |
-| P3 | Advisory — log as tech debt | 80–89 | Level AAA | — | — |
+| P1 | Blocker — fix before shipping | Score < 50 | **Level A failure** — puts the target out of reach | Semgrep security, ESLint error | Core vital rated poor |
+| P2 | Warning — track before merging | 50–79 | **Level AA failure** | ESLint warning | Needs improvement, or any diagnostic |
+| P3 | Advisory — log as tech debt | 80–89 | **Above the target**, or a best-practice rule | — | — |
 | *(suppressed)* | Passing — never reported | ≥ 90 | — | — | Good |
 
 Lighthouse findings are actually ranked by `weight × (1 − score)` — the category

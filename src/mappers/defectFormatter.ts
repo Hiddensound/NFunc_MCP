@@ -4,10 +4,10 @@ import type {
 } from "../utils/outputParsers.js";
 import {
   lighthouseImpactToPriority,
-  a11yTechniqueToPriority,
-  axeImpactToPriority,
   staticAnalysisToPriority,
+  wcagConformanceToPriority,
 } from "./priorityMapper.js";
+import { criterionByNumber, type TargetLevel } from "./wcagLevels.js";
 import type { Finding } from "../types.js";
 
 type Templater = (a: LighthouseAuditRef) => string;
@@ -468,42 +468,90 @@ function axeDescription(violation: Pa11yViolation): string {
     : `axe rule "${violation.code}" failed; assistive-tech users are likely affected.`;
 }
 
-export function formatA11yFinding(violation: Pa11yViolation): Finding | null {
+/**
+ * One pa11y violation → a Finding, priced by WCAG conformance.
+ *
+ * `target` is the conformance level the project has committed to (AA for
+ * essentially all commercial work). It decides whether a criterion is a gap or
+ * an enhancement, so it belongs in the finding, not just the summary.
+ */
+export function formatA11yFinding(
+  violation: Pa11yViolation,
+  target: TargetLevel = "AA",
+): Finding | null {
   if (violation.type === "notice") return null;
 
+  const criterion = violation.criterion ? criterionByNumber(violation.criterion) : null;
+  const { priority, blocksTarget } = wcagConformanceToPriority(violation.wcagLevel, target, {
+    axeImpact: violation.impact,
+    needsReview: violation.needsReview,
+  });
+  if (!priority) return null;
+
+  // Every finding says which criterion it maps to and whether that criterion is
+  // required at the committed level. Without it a reader cannot tell a
+  // conformance gap from a best-practice nit, and the two carry very different
+  // consequences.
+  const wcagEvidence = criterion
+    ? {
+        wcag_criterion: criterion.number,
+        wcag_name: criterion.name,
+        wcag_level: criterion.level,
+        blocks_target: blocksTarget,
+      }
+    : { wcag_criterion: null, wcag_level: "not-a-criterion", blocks_target: false };
+
   if (violation.runner === "axe") {
-    const priority = axeImpactToPriority(violation.impact, violation.needsReview);
-    if (!priority) return null;
     return {
       priority,
       title: violation.message.replace(/\s*\(https?:\/\/[^)]*\)\s*$/, "").trim() || violation.code,
-      description: axeDescription(violation),
+      description: withConformanceNote(axeDescription(violation), criterion, blocksTarget, target),
       evidence: {
         rule_code: violation.code,
         selector: violation.selector,
         runner: "axe",
+        ...wcagEvidence,
         ...(violation.impact ? { axe_impact: violation.impact } : {}),
         ...(violation.needsReview ? { needs_manual_review: true } : {}),
       },
     };
   }
 
-  const priority = a11yTechniqueToPriority(
-    violation.technique,
-    violation.wcagLevel,
-  );
-  if (!priority) return null;
   const describe = lookupA11yTemplate(violation.technique);
-  const description = describe
-    ? describe(violation)
-    : fallbackA11yDescription(violation);
+  const description = describe ? describe(violation) : fallbackA11yDescription(violation);
   return {
     priority,
     title: violation.message.split(/\.\s|\.$/)[0] || violation.code,
-    description,
+    description: withConformanceNote(description, criterion, blocksTarget, target),
     evidence: {
       rule_code: violation.code,
       selector: violation.selector,
+      ...wcagEvidence,
     },
   };
+}
+
+/**
+ * Append what the finding means for the conformance claim.
+ *
+ * A defect description says what is broken for users. This says what it costs
+ * the project — and for a Level A failure under an AA commitment, that is the
+ * sentence a release manager needs, not the technique name.
+ */
+function withConformanceNote(
+  description: string,
+  criterion: ReturnType<typeof criterionByNumber>,
+  blocksTarget: boolean,
+  target: TargetLevel,
+): string {
+  if (!criterion) {
+    return `${description} This is a best-practice check, not a WCAG success criterion — worth fixing, but it does not affect a conformance claim.`;
+  }
+  if (!blocksTarget) {
+    return `${description} Maps to WCAG ${criterion.number} ${criterion.name} (Level ${criterion.level}), which is above the committed Level ${target} target — an enhancement, not a conformance gap.`;
+  }
+  if (criterion.level === "A") {
+    return `${description} Fails WCAG ${criterion.number} ${criterion.name} at Level A. Level A is the floor: while this fails, Level ${target} conformance is not achievable regardless of how the other criteria score.`;
+  }
+  return `${description} Fails WCAG ${criterion.number} ${criterion.name} at Level ${criterion.level}, which is required for the committed Level ${target} target.`;
 }

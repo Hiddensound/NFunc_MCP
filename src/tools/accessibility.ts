@@ -16,6 +16,11 @@ import type { Finding } from "../types.js";
 import { resolveUrlInputs } from "../utils/urlInput.js";
 import { compareRuns, type DefectRef } from "../mappers/runComparator.js";
 import {
+  summariseConformance,
+  type ConformanceSummary,
+  type TargetLevel,
+} from "../mappers/wcagLevels.js";
+import {
   DEFAULT_MAX_SECONDS_PER_CALL,
   decodeCursor,
   encodeCursor,
@@ -58,6 +63,16 @@ const inputShape = {
         "batch mode.",
     ),
   urls: z.array(z.string()).optional(),
+  target_level: z
+    .enum(["A", "AA", "AAA"])
+    .optional()
+    .describe(
+      "WCAG conformance level the project has committed to. Default 'AA' — the " +
+        "legal and industry bar for essentially all commercial work. This drives " +
+        "priority: a Level A failure is P1 because it puts the target out of " +
+        "reach entirely, a Level AA failure is P2, and a criterion above the " +
+        "target is P3 (an enhancement, not a gap).",
+    ),
   form_factor: z
     .enum(["desktop", "mobile", "both"])
     .optional()
@@ -124,6 +139,7 @@ async function auditUrl(
   standard: string,
   ignore: string[] | undefined,
   formFactor: A11yFormFactor,
+  target: TargetLevel,
 ): Promise<A11yOutcome> {
   const configPath = formFactor === "mobile" ? await mobileConfig() : null;
 
@@ -161,7 +177,7 @@ async function auditUrl(
       return { findings: [], rawCount: 0, runnersUsed: [], error: `unparseable pa11y JSON: ${(err as Error).message}` };
     }
     for (const violation of parsed.violations) {
-      const finding = formatA11yFinding(violation);
+      const finding = formatA11yFinding(violation, target);
       if (finding) rawFindings.push(finding);
     }
   }
@@ -190,6 +206,7 @@ interface A11yRecord extends BatchRecord {
   rules: string[];
   /** Rule id + priority per defect, so a later run can diff against this one. */
   defects: Array<{ id: string; priority: Finding["priority"]; title: string }>;
+  conformance: ConformanceSummary;
   report_file: string;
 }
 
@@ -223,7 +240,69 @@ function recordsToDefectRefs(records: A11yRecord[]): DefectRef[] {
  * of them — while a rule failing on one page is that page's own bug. Volume
  * alone cannot tell those apart, so the rollup counts pages per rule.
  */
-function aggregateA11y(records: A11yRecord[]) {
+/**
+ * Cross-page conformance.
+ *
+ * A criterion failing on one page fails the site's conformance claim just as
+ * surely as one failing everywhere — conformance is per page, and a statement
+ * about a site is only as good as its worst page. So the rollup is a union of
+ * failing criteria, with the pages each affects.
+ */
+function rollUpConformance(records: A11yRecord[], target: TargetLevel) {
+  const byCriterion = new Map<
+    string,
+    { criterion: string; name: string; level: string; pages: Set<string>; blocks_target: boolean }
+  >();
+  for (const record of records) {
+    for (const failed of record.conformance?.failed_criteria ?? []) {
+      const entry = byCriterion.get(failed.criterion) ?? {
+        criterion: failed.criterion,
+        name: failed.name,
+        level: failed.level,
+        pages: new Set<string>(),
+        blocks_target: failed.blocks_target,
+      };
+      entry.pages.add(record.url);
+      byCriterion.set(failed.criterion, entry);
+    }
+  }
+  const pages = new Set(records.map((r) => r.url)).size;
+  const all = [...byCriterion.values()].sort(
+    (a, b) => a.level.length - b.level.length || a.criterion.localeCompare(b.criterion),
+  );
+  const blocking = all.filter((c) => c.blocks_target);
+  const conformantPages = records.filter((r) => r.conformance?.conformant).length;
+
+  return {
+    target_level: target,
+    pages_conformant: conformantPages,
+    pages_total: pages,
+    failing_criteria: {
+      A: blocking.filter((c) => c.level === "A").length,
+      AA: blocking.filter((c) => c.level === "AA").length,
+      AAA: blocking.filter((c) => c.level === "AAA").length,
+    },
+    beyond_target: all.length - blocking.length,
+    criteria: all.map((c) => ({
+      criterion: c.criterion,
+      name: c.name,
+      level: c.level,
+      pages_affected: c.pages.size,
+      of_pages: pages,
+      blocks_target: c.blocks_target,
+    })),
+    summary:
+      blocking.length === 0
+        ? `No Level ${target} conformance failures across ${pages} page(s) by automated testing. Manual verification still required — automated tools reach roughly a third of WCAG criteria.`
+        : `${conformantPages} of ${pages} page(s) pass automated Level ${target} checks. ` +
+          `${blocking.length} distinct criteri${blocking.length === 1 ? "on" : "a"} fail across the set` +
+          (blocking.some((c) => c.level === "A")
+            ? `, including ${blocking.filter((c) => c.level === "A").length} at Level A — the floor, which must be cleared before Level ${target} is reachable.`
+            : "."),
+  };
+}
+
+function aggregateA11y(records: A11yRecord[], target: TargetLevel) {
   const pages = new Set(records.map((r) => r.url)).size;
   const byRule = new Map<string, { rule: string; pages: Set<string>; runs: number }>();
   for (const record of records) {
@@ -256,6 +335,7 @@ function aggregateA11y(records: A11yRecord[]) {
     pages,
     run_count: records.length,
     captured_at: new Date().toISOString(),
+    conformance: rollUpConformance(records, target),
     totals: {
       violations: records.reduce((n, r) => n + r.violation_count, 0),
       p1: records.reduce((n, r) => n + r.p1_count, 0),
@@ -314,10 +394,19 @@ export function registerAccessibilityTool(server: McpServer) {
       inputSchema: inputShape,
     },
     async ({
-      url, urls, standard, ignore, runner, form_factor,
+      url, urls, standard, ignore, runner, form_factor, target_level,
       output_dir, cursor, max_seconds_per_call, skip_completed, baseline_dir,
     }) => {
-      const resolvedStandard = standard ?? "WCAG2AA";
+      const target: TargetLevel = target_level ?? "AA";
+      // Always test at AA or above, whatever the committed target.
+      //
+      // Testing only at Level A when the target is A would mean AA criteria are
+      // never checked, so they can neither fail nor be reported as
+      // enhancements — the run would silently hide information rather than
+      // classify it. Testing at AA and letting `target` decide what *blocks*
+      // keeps the classification honest: an AA finding under a Level A
+      // commitment is an enhancement, not a gap, and the report says so.
+      const resolvedStandard = standard ?? (target === "AAA" ? "WCAG2AAA" : "WCAG2AA");
       const resolvedRunner = runner ?? "htmlcs";
       const engines: Array<"htmlcs" | "axe"> =
         resolvedRunner === "both" ? ["htmlcs", "axe"] : [resolvedRunner];
@@ -359,8 +448,8 @@ export function registerAccessibilityTool(server: McpServer) {
 
       // ---- Single URL, single viewport: unchanged contract --------------
       if (resolved.urls.length === 1 && factors.length === 1) {
-        const target = resolved.urls[0];
-        const outcome = await auditUrl(target, engines, resolvedStandard, ignore, factors[0]);
+        const target2 = resolved.urls[0];
+        const outcome = await auditUrl(target2, engines, resolvedStandard, ignore, factors[0], target);
         if (outcome.error) {
           return {
             ...text({
@@ -375,13 +464,14 @@ export function registerAccessibilityTool(server: McpServer) {
         if (outcome.partial) warnings.push(outcome.partial);
 
         const record: A11yRecord = {
-          url: target,
+          url: target2,
           variant: factors[0],
           violation_count: outcome.findings.length,
           raw_violation_count: outcome.rawCount,
           p1_count: outcome.findings.filter((f) => f.priority === "P1").length,
           rules: [...new Set(outcome.findings.map(ruleIdOf))],
           defects: toDefects(outcome.findings),
+          conformance: summariseConformance(outcome.findings, target),
           report_file: "",
         };
 
@@ -392,10 +482,10 @@ export function registerAccessibilityTool(server: McpServer) {
         if (output_dir) {
           const dir = resolve(output_dir);
           await mkdir(dir, { recursive: true });
-          record.report_file = `${slugForUrl(target)}_${factors[0]}.json`;
+          record.report_file = `${slugForUrl(target2)}_${factors[0]}.json`;
           await writeFile(
             join(dir, record.report_file),
-            JSON.stringify({ url: target, form_factor: factors[0], standard: resolvedStandard,
+            JSON.stringify({ url: target2, form_factor: factors[0], standard: resolvedStandard,
               runners: engines, violation_count: outcome.findings.length,
               raw_violation_count: outcome.rawCount, findings: outcome.findings }, null, 2),
             "utf8",
@@ -405,9 +495,11 @@ export function registerAccessibilityTool(server: McpServer) {
 
         const comparison = await compareWith([record]);
         return text({
-          url: target,
+          url: target2,
           standard: resolvedStandard,
           runners: engines,
+          target_level: target,
+          conformance: summariseConformance(outcome.findings, target),
           ...(factors[0] === "mobile" ? { form_factor: "mobile" } : {}),
           violation_count: outcome.findings.length,
           // Pre-dedup total, so a large drop between the two is explainable
@@ -465,7 +557,7 @@ export function registerAccessibilityTool(server: McpServer) {
 
         const unit = units[index];
         const factor = unit.variant as A11yFormFactor;
-        const outcome = await auditUrl(unit.url, engines, resolvedStandard, ignore, factor);
+        const outcome = await auditUrl(unit.url, engines, resolvedStandard, ignore, factor, target);
 
         if (outcome.error) {
           failures.push({ url: unit.url, form_factor: factor, error: outcome.error });
@@ -508,6 +600,7 @@ export function registerAccessibilityTool(server: McpServer) {
           p1_count: outcome.findings.filter((f) => f.priority === "P1").length,
           rules,
           defects: toDefects(outcome.findings),
+          conformance: summariseConformance(outcome.findings, target),
           report_file: reportFile,
         });
         results.push({
@@ -515,6 +608,7 @@ export function registerAccessibilityTool(server: McpServer) {
           form_factor: factor,
           violation_count: outcome.findings.length,
           raw_violation_count: outcome.rawCount,
+          conformance: summariseConformance(outcome.findings, target),
           findings: outcome.findings,
           report_file: reportFile,
         });
@@ -541,7 +635,7 @@ export function registerAccessibilityTool(server: McpServer) {
       let comparison: unknown;
       if (complete) {
         const all = await readIndex<A11yRecord>(dir);
-        aggregateBlock = aggregateA11y(all);
+        aggregateBlock = aggregateA11y(all, target);
         comparison = await compareWith(all);
       }
 
@@ -553,6 +647,7 @@ export function registerAccessibilityTool(server: McpServer) {
         ...(resolved.source ? { input_source: resolved.source } : {}),
         standard: resolvedStandard,
         runners: engines,
+        target_level: target,
         form_factor: requestedFactor,
         output_dir: dir,
         index_file: indexPath,
