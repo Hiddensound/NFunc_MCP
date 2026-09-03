@@ -572,7 +572,16 @@ because it is real users, not because it is current.
 | `sitemap` (default) | robots.txt, then `/sitemap.xml` and `/sitemap_index.xml`, then `<link rel="sitemap">`, then seven common CMS locations. Tiers only advance when earlier ones find nothing. |
 | `list` | Explicit `urls` array. |
 | `csv` | `csv_path` — column detected by name or by content. An analytics top-pages export is the best input for a performance audit, being traffic-weighted. |
-| `crawl` | Not implemented, and [declined deliberately](../performance-audit-plan.md) — static crawling finds 7–11 internal links on modern commerce homepages. |
+| `crawl` | Not implemented, and declined deliberately — see below. |
+
+**Why there is no crawler.** Static link extraction was measured against real
+homepages and found 11 internal paths on nodejs.org (whose sitemap has 1,723),
+7 on gap.com, and nothing at all on a site behind a bot wall. The pages most
+likely to lack a sitemap are the same ones that are client-rendered or
+bot-protected, so a crawler fails precisely where it would be needed. An
+analytics top-pages export is a better input anyway, being weighted by real
+traffic. If one is ever built it should drive a headless browser rather than
+parse static HTML.
 
 Discovered URLs are clustered into **templates** by path shape, and the plan
 tool proposes representative samples per template. Passing a URL with a path
@@ -667,7 +676,9 @@ Adjustments:
 │   │   ├── compositeScore.ts        # Per-tool sub-scores
 │   │   ├── webVitalsMapper.ts       # CrUX thresholds → priorities → prose
 │   │   ├── labFieldComparator.ts    # Lab vs field verdicts
-│   │   └── psiAggregator.ts         # Cross-run arithmetic + redundancy rules
+│   │   ├── psiAggregator.ts         # Cross-run arithmetic + redundancy rules
+│   │   ├── runComparator.ts         # Before/after diff: fixed, still failing, new
+│   │   └── wcagLevels.ts            # WCAG 2.1 criteria, levels, conformance rollup
 │   └── utils/                       # Cross-tool helpers
 │       ├── shellRunner.ts           # Subprocess choke point
 │       ├── httpClient.ts            # HTTP choke point (retry, deadline, redaction)

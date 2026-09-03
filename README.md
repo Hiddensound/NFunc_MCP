@@ -159,6 +159,12 @@ can detect it. On one real homepage the lab reported a perfect CLS of 0 while
 | **P2** | Warning — track before merging |
 | **P3** | Advisory — log as tech debt |
 
+Priority is derived, not guessed. Accessibility findings follow **WCAG 2.1
+conformance** — a Level A failure is P1 because it puts an AA claim out of
+reach. Lighthouse findings are ranked by the category points an audit actually
+costs, not by score alone. Semgrep `security` findings are P1 regardless of the
+severity Semgrep assigned them.
+
 Corroborated and field-confirmed findings are promoted a tier; lab-only
 findings that real users don't experience are demoted.
 [Full mapping →](docs/manual.md#priority-system)
