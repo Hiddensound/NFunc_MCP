@@ -175,6 +175,97 @@ export function staticAnalysisToPriority(
   return null;
 }
 
+/**
+ * Severity-only fallback for a Trivy vulnerability.
+ *
+ * Used when the PkgID join onto Packages[] missed, so `relationship` and `dev`
+ * are unknown. Same role as `lighthouseScoreToPriority` inside
+ * `lighthouseImpactToPriority`: the richer signal is unavailable, so fall back
+ * to the coarse one rather than inventing a value for the missing field.
+ *
+ * CRITICAL still reaches P1 here. Guessing "indirect" to be safe would quietly
+ * demote a genuine emergency, and a silent demotion is worse than a coarse
+ * ranking — the finding is marked `relationship_unknown` so the caller can see
+ * which rung it was priced on.
+ */
+export function trivySeverityToPriority(severity: string): Priority {
+  if (severity === "CRITICAL") return "P1";
+  if (severity === "HIGH") return "P2";
+  return "P3";
+}
+
+export interface TrivyVulnSignals {
+  severity: string;
+  /** Trivy states no upstream fix exists, or none was offered. */
+  unfixable: boolean;
+  relationship: string;
+  dev: boolean;
+  /** Whether relationship/dev came from a successful package join. */
+  joined: boolean;
+}
+
+/**
+ * Priority for a dependency vulnerability, from remediability rather than
+ * severity.
+ *
+ * Severity alone is the same failure `lighthouseImpactToPriority` was written
+ * to fix: on a real Node tree most CRITICALs are transitive, unfixable, or
+ * confined to devDependencies, so ranking on `Severity` puts an unfixable CVE
+ * in a build-time package above a one-line bump of a direct runtime
+ * dependency. What a triager wants first is the fix they can land today.
+ *
+ *   CRITICAL/HIGH + fix + direct    → P1   severe, yours, one version bump
+ *   CRITICAL/HIGH + fix + indirect  → P2   same severity, an override to land
+ *   MEDIUM        + fix + direct    → P2   worth the sprint, not the hotfix
+ *   MEDIUM        + fix + indirect  → P3
+ *   LOW / UNKNOWN                   → P3   reportable, never blocking
+ *   devDependency                   → demoted one tier; it does not ship
+ *
+ * Unfixable vulnerabilities never reach this function. They are a decision
+ * queue rather than a work queue — blocking a release on something nobody can
+ * fix is a gate that can never pass — so the tool routes them to `unfixable`
+ * instead of assigning them a tier here.
+ */
+export function trivyVulnToPriority(signals: TrivyVulnSignals): Priority {
+  const { severity, relationship, dev, joined } = signals;
+
+  let priority: Priority;
+  if (!joined) {
+    priority = trivySeverityToPriority(severity);
+  } else {
+    // root and workspace are the scanned project itself: as directly yours as
+    // a direct dependency, and fixable on the same terms.
+    const isDirect =
+      relationship === "direct" ||
+      relationship === "root" ||
+      relationship === "workspace";
+
+    if (severity === "CRITICAL" || severity === "HIGH") {
+      priority = isDirect ? "P1" : "P2";
+    } else if (severity === "MEDIUM") {
+      priority = isDirect ? "P2" : "P3";
+    } else {
+      priority = "P3";
+    }
+  }
+
+  return dev ? DEMOTE[priority] : priority;
+}
+
+/**
+ * Priority for an infrastructure misconfiguration.
+ *
+ * Capped at P2 on purpose. A misconfiguration is a statement about declared
+ * configuration, not an observed failure, and the evidence that it actually
+ * bites is the browser-side symptom — a missing header showing up as a
+ * Lighthouse `csp-xss` failure. Promotion to P1 belongs with that correlation,
+ * not here, so this tier stays honest when the scanner runs alone.
+ */
+export function trivyMisconfigToPriority(severity: string): Priority {
+  if (severity === "CRITICAL" || severity === "HIGH") return "P2";
+  return "P3";
+}
+
 export function sortFindingsByPriority<T extends Finding>(findings: T[]): T[] {
   return findings.sort(
     (a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority],

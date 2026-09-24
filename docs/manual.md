@@ -21,7 +21,7 @@ tools are and how to ask for them; this covers how to run and interpret them.
 
 ## Prerequisites
 
-Four of the tools wrap CLIs. Install the ones you need:
+Five of the tools wrap CLIs. Install the ones you need:
 
 | Tool | Install | Used by |
 |---|---|---|
@@ -29,16 +29,35 @@ Four of the tools wrap CLIs. Install the ones you need:
 | pa11y | `npm install -g pa11y` | `run_accessibility_check`, `run_qa_gate` (URL) |
 | ESLint | `npm install -g eslint` | `run_static_analysis`, `run_qa_gate` (path) |
 | Semgrep | `brew install semgrep` or `pip install semgrep` | `run_static_analysis`, `run_qa_gate` (path) |
+| Trivy | `brew install trivy`, `choco install trivy`, or [apt/yum/apk](https://trivy.dev/latest/getting-started/installation/) | `run_security_scan` |
 
 Verify:
 
 ```bash
-lighthouse --version && pa11y --version && eslint --version && semgrep --version
+lighthouse --version && pa11y --version && eslint --version && semgrep --version && trivy --version
 ```
 
-**You don't need all four.** A missing tool shows `UNAVAILABLE` in the
+**You don't need all five.** A missing tool shows `UNAVAILABLE` in the
 scorecard and its findings are skipped; the gate still runs. URL-only runs need
 Lighthouse and pa11y; path-only runs need ESLint and Semgrep.
+
+### Trivy's vulnerability database
+
+Trivy is the one CLI here that needs data as well as a binary. Do the download
+once, before the first scan:
+
+```bash
+trivy fs --download-db-only
+```
+
+That pulls roughly 113 MB from `mirror.gcr.io`, falling back to `ghcr.io`. Doing
+it up front matters because a cold first scan pays for the download inside the
+scan's own time budget, and both registries rate-limit — a `TOOMANYREQUESTS`
+during a QA run is a confusing way to discover this.
+
+Trivy refreshes the database on its own afterwards. A database problem is
+reported as a warning rather than an error: secret and misconfiguration
+findings need no database, so they still come back.
 
 ### PageSpeed Insights API key
 
@@ -382,6 +401,58 @@ ESLint config when it finds one, otherwise a QA-focused baseline. Returns
 `warnings`.
 
 
+### `run_security_scan`
+
+Trivy over a local directory. Returns `path`, `tools_run`, `scanners`,
+`db_status`, `scores.security`, `issue_count`, `counts`, `findings`, and
+optionally `unfixable`, `licenses` and `warnings`.
+
+**Inputs**
+
+| Input | Default | Notes |
+|---|---|---|
+| `path` | — | Directory to scan. |
+| `scanners` | `["vuln","secret","misconfig"]` | Any of `vuln`, `secret`, `misconfig`, `license`. |
+| `min_severity` | all | `UNKNOWN`–`CRITICAL`. Rarely needed; see the caveat below. |
+| `skip_dirs` | — | Directories or globs to skip. |
+
+**Why the defaults are what they are.** Trivy's own default for a filesystem
+scan is `vuln,secret` — infrastructure misconfiguration is off unless you ask,
+which is a quiet way to ship a security scan that never opens the Dockerfile.
+So `misconfig` is on here. `license` is off, because a GPL transitive
+dependency is a legal call rather than a defect: it is reported in its own
+block, carries no priority, and never affects the score.
+
+**One finding per fix.** Vulnerabilities are grouped by package and version,
+so 38 CVEs across a small tree come back as three findings — "upgrade axios
+0.21.0 → 1.18.0, clears 25 advisories" — with the full advisory list in
+evidence. The recommended version is the highest fix across the group, which is
+the lowest single upgrade that clears all of them.
+
+**Priority is remediability, not severity.** A critical CVE in a direct runtime
+dependency with a fix available is P1: severe, yours, one version bump. The
+same severity in a transitive dependency is P2, because the fix is an override
+or an upstream release. devDependencies are demoted one tier — the code does
+not ship, though it still runs in CI. See [Priority system](#priority-system).
+
+**Unfixable CVEs are a separate list.** Anything Trivy reports with no upstream
+fix goes to `unfixable` rather than `findings`. Blocking a release on something
+nobody can fix is a gate that can never pass, so these are a decision queue —
+compensating control, replacement, or documented acceptance — kept out of the
+work queue. They are deliberately not hidden: `--ignore-unfixed` would suppress
+exactly these, and then the decision never gets made.
+
+**Caveat on `min_severity`.** Filtering changes the recommended upgrade target,
+because the recommendation is derived from the advisories that survived the
+filter. Scanning the same tree at `HIGH` suggested axios 1.16.0 where the
+unfiltered scan suggested 1.18.0. Prefer leaving it unset and reading the
+priorities.
+
+**Secrets.** Findings carry the file, line, rule id and category — never the
+matched value, and never the surrounding source lines, even though Trivy masks
+them. Rotate first: deleting the line does not revoke a credential that is
+still in git history.
+
 ### Auditing several URLs at once
 
 `run_lighthouse` and `run_accessibility_check` both accept three input shapes in
@@ -632,18 +703,31 @@ output into a written report.
 
 ## Priority system
 
-| Priority | Meaning | Lighthouse | WCAG | ESLint / Semgrep | CrUX field |
-|---|---|---|---|---|---|
-| P1 | Blocker — fix before shipping | Score < 50 | **Level A failure** — puts the target out of reach | Semgrep security, ESLint error | Core vital rated poor |
-| P2 | Warning — track before merging | 50–79 | **Level AA failure** | ESLint warning | Needs improvement, or any diagnostic |
-| P3 | Advisory — log as tech debt | 80–89 | **Above the target**, or a best-practice rule | — | — |
-| *(suppressed)* | Passing — never reported | ≥ 90 | — | — | Good |
+| Priority | Meaning | Lighthouse | WCAG | ESLint / Semgrep | Trivy | CrUX field |
+|---|---|---|---|---|---|---|
+| P1 | Blocker — fix before shipping | Score < 50 | **Level A failure** — puts the target out of reach | Semgrep security, ESLint error | Committed secret; critical/high CVE, fix available, **direct** dependency | Core vital rated poor |
+| P2 | Warning — track before merging | 50–79 | **Level AA failure** | ESLint warning | Same severity but **transitive**; medium + direct; high/critical misconfiguration | Needs improvement, or any diagnostic |
+| P3 | Advisory — log as tech debt | 80–89 | **Above the target**, or a best-practice rule | — | Medium + transitive; low/unknown; other misconfiguration | — |
+| *(suppressed)* | Passing — never reported | ≥ 90 | — | — | Passing checks; licences carry no priority | Good |
 
 Lighthouse findings are actually ranked by `weight × (1 − score)` — the category
 points an audit really costs — rather than by score alone, so a weight-30 metric
 failing outright outranks a weight-1 SEO check that also scores 0.
 
+Trivy findings follow the same principle applied to remediation: severity says
+how bad a CVE is, not how soon you can be rid of it. On a typical tree most
+criticals are transitive, unfixable, or confined to devDependencies, so ranking
+on severity alone puts an unfixable CVE in a build-time package above a
+one-line bump of a direct runtime dependency. Vulnerabilities with **no
+upstream fix** are not ranked at all — they leave the work queue for the
+`unfixable` decision queue.
+
 Adjustments:
+
+- **devDependency** findings are demoted one tier — the code does not ship,
+  though it still runs on developer machines and in CI.
+- When Trivy does not report whether a package is direct or transitive, the
+  finding is ranked on severity alone and tagged `relationship_unknown`.
 
 - **Corroborated** findings (two tools agreeing) are promoted one tier.
 - **Field-confirmed** findings are promoted one tier; **lab-only** findings
@@ -666,6 +750,7 @@ Adjustments:
 │   │   ├── lighthouse.ts
 │   │   ├── accessibility.ts
 │   │   ├── staticAnalysis.ts
+│   │   ├── securityScan.ts          # run_security_scan (Trivy)
 │   │   ├── performanceAuditPlan.ts  # plan_performance_audit
 │   │   └── performanceAudit.ts      # run_performance_audit
 │   ├── mappers/                     # Raw output → QA report shape
@@ -673,6 +758,7 @@ Adjustments:
 │   │   ├── defectFormatter.ts       # Findings and defect prose
 │   │   ├── priorityMapper.ts        # Score/severity → P1/P2/P3
 │   │   ├── a11yDedupe.ts            # Systemic a11y collapse
+│   │   ├── vulnAggregator.ts        # CVEs → one group per version bump
 │   │   ├── compositeScore.ts        # Per-tool sub-scores
 │   │   ├── webVitalsMapper.ts       # CrUX thresholds → priorities → prose
 │   │   ├── labFieldComparator.ts    # Lab vs field verdicts
@@ -684,6 +770,7 @@ Adjustments:
 │       ├── httpClient.ts            # HTTP choke point (retry, deadline, redaction)
 │       ├── reportGenerator.ts       # HTML report builder
 │       ├── outputParsers.ts         # Per-tool JSON parsers
+│       ├── trivyRunner.ts           # Trivy flags, install + DB detection
 │       ├── psiParser.ts             # PSI response → lab + field
 │       ├── psiAuth.ts               # API key resolution
 │       ├── sitemapReader.ts         # Tiered sitemap discovery
@@ -750,6 +837,24 @@ That URL has too little traffic for its own CrUX entry, so the numbers describe
 the whole origin. They are still real, but they do not describe the page you
 asked about. Two different URLs reporting identical p75 values are both being
 served origin data.
+
+### `run_security_scan` returns no findings and a Trivy warning
+
+Either Trivy is not on `PATH` — the warning names the install command for your
+platform — or its database could not be updated. The two are distinguishable:
+a missing binary returns `tools_run: []` immediately, while a database problem
+still returns secret and misconfiguration findings and warns that dependency
+findings may be incomplete. For the latter, run `trivy fs --download-db-only`
+once on a good connection. Both registries rate-limit, so a `429` during a busy
+CI window is worth simply retrying.
+
+### A dependency you expected is missing from the scan
+
+Two likely causes. Trivy omits devDependencies from npm lockfiles unless asked;
+this tool always passes `--include-dev-deps`, so if you are comparing against a
+bare `trivy fs` run on the command line, that is the difference. Second, if you
+set `min_severity`, anything below it is gone — including, silently, the
+advisories that would have raised the recommended upgrade target.
 
 ### A tool shows `UNAVAILABLE`
 
