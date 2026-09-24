@@ -1,6 +1,6 @@
 # nfunc-mcp
 
-[![npm](https://img.shields.io/npm/v/nfunc-mcp)](https://www.npmjs.com/package/nfunc-mcp) [![Socket Badge](https://badge.socket.dev/npm/package/nfunc-mcp/0.5.1)](https://badge.socket.dev/npm/package/nfunc-mcp/0.5.1)
+[![npm](https://img.shields.io/npm/v/nfunc-mcp)](https://www.npmjs.com/package/nfunc-mcp) [![Socket Badge](https://badge.socket.dev/npm/package/nfunc-mcp/0.6.0)](https://badge.socket.dev/npm/package/nfunc-mcp/0.6.0)
 
 A local MCP server that gives Claude a non-functional QA toolkit. Performance,
 accessibility, SEO, code quality and real-user Core Web Vitals — run
