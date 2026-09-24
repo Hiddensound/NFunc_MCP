@@ -334,6 +334,345 @@ export function parseSemgrepJSON(rawJson: string): ParsedSemgrep {
   return { findings };
 }
 
+// --- Trivy ---
+
+export type TrivySeverity = "UNKNOWN" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
+/**
+ * Trivy's `Package.Relationship`. Verified against
+ * aquasecurity/trivy pkg/fanal/types/package.go — the constants serialise as
+ * these five strings.
+ *
+ * `root` is the scanned project itself and `workspace` a workspace member;
+ * both are "yours" in the sense that matters for remediation, so they are
+ * treated alongside `direct` rather than as a third category. `unknown` means
+ * Trivy could not classify it, which is not the same as indirect — see
+ * `joined` on TrivyVulnerability.
+ */
+export type TrivyRelationship =
+  | "unknown"
+  | "root"
+  | "workspace"
+  | "direct"
+  | "indirect";
+
+/**
+ * Statuses that mean "no upstream fix exists".
+ *
+ * These are exactly the statuses Trivy's `--ignore-unfixed` suppresses. We
+ * deliberately do not pass that flag: an unfixable CVE is the one case that
+ * needs a human mitigation decision, and hiding it means the decision never
+ * gets made. They are separated out of the work queue instead.
+ */
+const NO_FIX_STATUSES = new Set([
+  "affected",
+  "will_not_fix",
+  "fix_deferred",
+  "end_of_life",
+]);
+
+export interface TrivyVulnerability {
+  id: string;
+  pkgId: string;
+  pkgName: string;
+  installedVersion: string;
+  /** Comma-separated in some ecosystems; split into a list here. */
+  fixedVersions: string[];
+  status: string;
+  /** True when no upstream fix exists — decision queue, not work queue. */
+  unfixable: boolean;
+  severity: TrivySeverity;
+  title: string;
+  primaryUrl: string;
+  target: string;
+  /** Joined from Results[].Packages[] — absent on the vulnerability itself. */
+  relationship: TrivyRelationship;
+  dev: boolean;
+  /**
+   * Whether the PkgID join onto Packages[] succeeded. False means
+   * `relationship` and `dev` are placeholders and the finding must be priced
+   * on severity alone, the same way lighthouseImpactToPriority falls back when
+   * an audit carries no category weight.
+   */
+  joined: boolean;
+}
+
+/**
+ * A Trivy secret finding, reduced to the fields that are safe to emit.
+ *
+ * Trivy's raw Secret object also carries `Match` and `Code.Lines[].Content`.
+ * Neither is represented here, and that is the entire point of this interface:
+ * CLAUDE.md states that secrets never reach tool output, `run_qa_gate` writes
+ * its report to disk, and Trivy's masking of `Match` is documented only for
+ * table output. Surrounding source lines can carry a second, unmasked
+ * credential. So the parser allowlists fields in rather than filtering fields
+ * out — a new upstream field cannot leak through a shape that never had a home
+ * for it.
+ */
+export interface TrivySecret {
+  ruleId: string;
+  category: string;
+  severity: TrivySeverity;
+  title: string;
+  startLine: number;
+  endLine: number;
+  target: string;
+}
+
+export interface TrivyMisconfiguration {
+  id: string;
+  avdId: string;
+  type: string;
+  title: string;
+  description: string;
+  message: string;
+  resolution: string;
+  severity: TrivySeverity;
+  target: string;
+  resource: string;
+  startLine: number | null;
+  primaryUrl: string;
+}
+
+export interface TrivyLicense {
+  pkgName: string;
+  name: string;
+  severity: TrivySeverity;
+  category: string;
+  filePath: string;
+  confidence: number;
+  link: string;
+}
+
+export interface ParsedTrivy {
+  artifactName: string;
+  vulnerabilities: TrivyVulnerability[];
+  secrets: TrivySecret[];
+  misconfigurations: TrivyMisconfiguration[];
+  licenses: TrivyLicense[];
+  /** Vulnerabilities whose PkgID join missed. Surfaced to the caller. */
+  unjoinedCount: number;
+}
+
+interface RawTrivyPackage {
+  ID?: string;
+  Name?: string;
+  Version?: string;
+  Dev?: boolean;
+  Relationship?: string;
+}
+
+interface RawTrivyVulnerability {
+  VulnerabilityID?: string;
+  PkgID?: string;
+  PkgName?: string;
+  InstalledVersion?: string;
+  FixedVersion?: string;
+  Status?: string;
+  Severity?: string;
+  Title?: string;
+  PrimaryURL?: string;
+}
+
+// Match and Code are deliberately absent — see TrivySecret.
+interface RawTrivySecret {
+  RuleID?: string;
+  Category?: string;
+  Severity?: string;
+  Title?: string;
+  StartLine?: number;
+  EndLine?: number;
+}
+
+interface RawTrivyMisconfiguration {
+  ID?: string;
+  AVDID?: string;
+  Type?: string;
+  Title?: string;
+  Description?: string;
+  Message?: string;
+  Resolution?: string;
+  Severity?: string;
+  Status?: string;
+  PrimaryURL?: string;
+  CauseMetadata?: { Resource?: string; StartLine?: number };
+}
+
+interface RawTrivyLicense {
+  Severity?: string;
+  Category?: string;
+  PkgName?: string;
+  FilePath?: string;
+  Name?: string;
+  Confidence?: number;
+  Link?: string;
+}
+
+interface RawTrivyResult {
+  Target?: string;
+  Class?: string;
+  Packages?: RawTrivyPackage[];
+  Vulnerabilities?: RawTrivyVulnerability[];
+  Misconfigurations?: RawTrivyMisconfiguration[];
+  Secrets?: RawTrivySecret[];
+  Licenses?: RawTrivyLicense[];
+}
+
+function normaliseSeverity(raw: string | undefined): TrivySeverity {
+  const s = (raw ?? "").toUpperCase();
+  if (s === "CRITICAL" || s === "HIGH" || s === "MEDIUM" || s === "LOW") return s;
+  return "UNKNOWN";
+}
+
+function normaliseRelationship(raw: string | undefined): TrivyRelationship {
+  const r = (raw ?? "").toLowerCase();
+  if (r === "root" || r === "workspace" || r === "direct" || r === "indirect") return r;
+  return "unknown";
+}
+
+/** "1.2.3" → ["1.2.3"]; "1.2.3, 2.0.1" → ["1.2.3", "2.0.1"]; "" → []. */
+function splitFixedVersions(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+}
+
+/**
+ * One Trivy JSON report → the four finding classes, with the package join
+ * applied.
+ *
+ * The join is the reason this function is longer than its siblings.
+ * `DetectedVulnerability` carries no Relationship and no Dev field — verified
+ * against pkg/types/vulnerability.go — so the two signals the priority model
+ * needs most live on `Package`, in the same Result's `Packages[]` array. That
+ * array is present because `--list-all-pkgs` defaults to true.
+ *
+ * Keyed on `PkgID`, never on `PkgIdentifier.PURL`: PURL carries `json:"-"` and
+ * depends on custom marshalling that has shipped empty (trivy#7464). A
+ * `name@version` secondary key covers the ecosystems where PkgID comes back
+ * blank, and anything still unmatched is flagged rather than assumed.
+ */
+export function parseTrivyJSON(rawJson: string): ParsedTrivy {
+  const report = JSON.parse(rawJson) as {
+    ArtifactName?: string;
+    Results?: RawTrivyResult[];
+  };
+
+  const vulnerabilities: TrivyVulnerability[] = [];
+  const secrets: TrivySecret[] = [];
+  const misconfigurations: TrivyMisconfiguration[] = [];
+  const licenses: TrivyLicense[] = [];
+  let unjoinedCount = 0;
+
+  for (const result of report.Results ?? []) {
+    const target = result.Target ?? "";
+
+    // Per-Result package index. Packages are scoped to their Result (the same
+    // package name can appear at different versions in two lockfiles), so
+    // building one index across the whole report would cross-contaminate.
+    const byId = new Map<string, RawTrivyPackage>();
+    const byNameVersion = new Map<string, RawTrivyPackage>();
+    for (const pkg of result.Packages ?? []) {
+      if (pkg.ID) byId.set(pkg.ID, pkg);
+      if (pkg.Name && pkg.Version) byNameVersion.set(`${pkg.Name}@${pkg.Version}`, pkg);
+    }
+
+    for (const vuln of result.Vulnerabilities ?? []) {
+      const pkgName = vuln.PkgName ?? "";
+      const installedVersion = vuln.InstalledVersion ?? "";
+      const pkgId = vuln.PkgID ?? "";
+
+      const pkg =
+        (pkgId ? byId.get(pkgId) : undefined) ??
+        byNameVersion.get(`${pkgName}@${installedVersion}`);
+      const joined = pkg !== undefined;
+      if (!joined) unjoinedCount += 1;
+
+      const fixedVersions = splitFixedVersions(vuln.FixedVersion);
+      const status = (vuln.Status ?? "").toLowerCase();
+
+      vulnerabilities.push({
+        id: vuln.VulnerabilityID ?? "",
+        pkgId,
+        pkgName,
+        installedVersion,
+        fixedVersions,
+        status,
+        // Both halves matter. A status in the no-fix set is Trivy stating there
+        // is no fix; an empty FixedVersion is the same fact arriving by
+        // omission, which is how several language ecosystems report it.
+        unfixable: fixedVersions.length === 0 || NO_FIX_STATUSES.has(status),
+        severity: normaliseSeverity(vuln.Severity),
+        title: vuln.Title ?? "",
+        primaryUrl: vuln.PrimaryURL ?? "",
+        target,
+        relationship: joined ? normaliseRelationship(pkg.Relationship) : "unknown",
+        dev: joined ? pkg.Dev === true : false,
+        joined,
+      });
+    }
+
+    for (const secret of result.Secrets ?? []) {
+      secrets.push({
+        ruleId: secret.RuleID ?? "",
+        category: secret.Category ?? "",
+        severity: normaliseSeverity(secret.Severity),
+        title: secret.Title ?? "",
+        startLine: secret.StartLine ?? 0,
+        endLine: secret.EndLine ?? 0,
+        target,
+      });
+    }
+
+    for (const mc of result.Misconfigurations ?? []) {
+      // Trivy includes PASS and EXCEPTION entries when asked to; a passing
+      // check is never a finding here, per the project-wide rule that nothing
+      // which passes is ever reported.
+      if ((mc.Status ?? "FAIL").toUpperCase() !== "FAIL") continue;
+      misconfigurations.push({
+        id: mc.ID ?? mc.AVDID ?? "",
+        avdId: mc.AVDID ?? "",
+        type: mc.Type ?? "",
+        title: mc.Title ?? "",
+        description: mc.Description ?? "",
+        message: mc.Message ?? "",
+        resolution: mc.Resolution ?? "",
+        severity: normaliseSeverity(mc.Severity),
+        target,
+        resource: mc.CauseMetadata?.Resource ?? "",
+        startLine:
+          typeof mc.CauseMetadata?.StartLine === "number"
+            ? mc.CauseMetadata.StartLine
+            : null,
+        primaryUrl: mc.PrimaryURL ?? "",
+      });
+    }
+
+    for (const lic of result.Licenses ?? []) {
+      licenses.push({
+        pkgName: lic.PkgName ?? "",
+        name: lic.Name ?? "",
+        severity: normaliseSeverity(lic.Severity),
+        category: lic.Category ?? "",
+        filePath: lic.FilePath ?? "",
+        confidence: typeof lic.Confidence === "number" ? lic.Confidence : 0,
+        link: lic.Link ?? "",
+      });
+    }
+  }
+
+  return {
+    artifactName: report.ArtifactName ?? "",
+    vulnerabilities,
+    secrets,
+    misconfigurations,
+    licenses,
+    unjoinedCount,
+  };
+}
+
 export function parsePa11yJSON(rawJson: string): ParsedPa11y {
   const parsed = JSON.parse(rawJson) as RawPa11yIssue[] | { issues?: RawPa11yIssue[] };
   const issues: RawPa11yIssue[] = Array.isArray(parsed)

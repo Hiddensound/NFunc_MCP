@@ -94,6 +94,23 @@ export function staticSubScore(findings: Finding[]): number {
   return decay(damageOf(findings), STATIC_K);
 }
 
+/**
+ * Security decays fastest of the three. A page with five accessibility P1s is
+ * a bad page; a codebase with five security P1s — a committed credential and
+ * four actively fixable critical CVEs — is not shippable, and the score should
+ * say so rather than land in the same band. At K = 50 one P1 scores 82, three
+ * score 55 and five score 37.
+ *
+ * Exported for the tool's own `scores.security`. Wiring it into `SubScores` and
+ * the composite weighting is deliberately left to the qa_gate phase, so that
+ * adding this function changes no existing score.
+ */
+const SECURITY_K = 50;
+
+export function securitySubScore(findings: Finding[]): number {
+  return decay(damageOf(findings), SECURITY_K);
+}
+
 export interface SubScores {
   lighthouse: number | null;
   pa11y: number | null;

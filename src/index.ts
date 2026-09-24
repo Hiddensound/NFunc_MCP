@@ -6,6 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { registerLighthouseTool } from "./tools/lighthouse.js";
 import { registerAccessibilityTool } from "./tools/accessibility.js";
 import { registerStaticAnalysisTool } from "./tools/staticAnalysis.js";
+import { registerSecurityScanTool } from "./tools/securityScan.js";
 import { registerQaGateTool } from "./tools/qaGate.js";
 import { registerPerformanceAuditPlanTool } from "./tools/performanceAuditPlan.js";
 import { registerPerformanceAuditTool } from "./tools/performanceAudit.js";
@@ -56,6 +57,7 @@ server.registerTool(
 registerLighthouseTool(server);
 registerAccessibilityTool(server);
 registerStaticAnalysisTool(server);
+registerSecurityScanTool(server);
 registerQaGateTool(server);
 registerPerformanceAuditPlanTool(server);
 registerPerformanceAuditTool(server);

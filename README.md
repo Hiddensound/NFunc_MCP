@@ -21,7 +21,8 @@ rather than raw tool output.
 | SEO | Lighthouse | Crawlability, robots.txt, meta, link text |
 | Best practices | Lighthouse | HTTPS, deprecated APIs, third-party cookies |
 | Code quality | ESLint | Dead code, undeclared vars, swallowed errors |
-| Security patterns | Semgrep | OWASP JS/TS patterns |
+| Security patterns | Semgrep | Code-level patterns in what you wrote |
+| Supply chain | Trivy | Dependency CVEs, committed secrets, Dockerfile and IaC misconfiguration |
 | Real-user vitals | PageSpeed Insights + CrUX | What actual visitors experienced, versus what the lab measures |
 
 Findings arrive prioritised **P1 / P2 / P3**, written as defect-ticket prose
@@ -37,8 +38,10 @@ claude mcp add nfunc-mcp -- npx -y nfunc-mcp
 ```
 
 Then install whichever CLIs you need — `lighthouse`, `pa11y`, `eslint`,
-`semgrep`. Missing tools are skipped rather than fatal, so start with what you
-have. For real-user field data, add a
+`semgrep`, `trivy`. Missing tools are skipped rather than fatal, so start with
+what you have. Trivy also wants a one-time database download
+(`trivy fs --download-db-only`, ~113 MB) before its first scan. For real-user
+field data, add a
 [PageSpeed Insights key](docs/manual.md#pagespeed-insights-api-key).
 
 Verify with `/mcp`, then ask Claude to *"call the nfunc-mcp ping tool."*
@@ -55,9 +58,18 @@ Verify with `/mcp`, then ask Claude to *"call the nfunc-mcp ping tool."*
 | `run_lighthouse` | Lighthouse for **one URL, a list, or a CSV**. `form_factor: "both"` finds device-specific defects the single profiles miss. |
 | `run_accessibility_check` | pa11y WCAG audit for **one URL, a list, or a CSV**. Findings are priced by **WCAG 2.1 conformance** — Level A failures are P1 because they put an AA claim out of reach. `runner: "axe"` for ARIA and design systems. |
 | `run_static_analysis` | ESLint + Semgrep over a local codebase. Uses your ESLint config if it finds one. |
+| `run_security_scan` | Trivy over a local codebase — dependency CVEs, committed secrets, IaC misconfiguration. Vulnerabilities are grouped into **one finding per version bump**, not one per CVE, and ranked on how cheaply they can be fixed rather than on raw severity. CVEs with no upstream fix go to a separate decision queue instead of blocking the work queue. |
 | `plan_performance_audit` | Plans a PageSpeed Insights audit — finds your URLs, groups them into page templates, costs the run. **Spends no quota.** |
 | `run_performance_audit` | Runs it. Lab scores, real-user field data, and the disagreements between them. |
 | `ping` | Health check. |
+
+### How they connect
+
+![How the QA tools work together](docs/images/qa-mcp-tool-graph.svg)
+
+When Lighthouse and pa11y flag the same WCAG technique, `run_qa_gate` merges
+the two findings, promotes the result one tier and marks it
+`confidence: "high"`. `run_security_scan` stands alone for now.
 
 ### Which one when
 

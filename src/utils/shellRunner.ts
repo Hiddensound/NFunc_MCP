@@ -11,6 +11,13 @@ export interface ShellRunOptions {
   timeoutMs?: number;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Cap on captured stdout/stderr. Left at execa's default for every tool that
+   * emits a summary, raised only by callers whose output is proportional to the
+   * size of the scanned tree — Trivy returns a full package inventory alongside
+   * its findings, because the direct/indirect join needs it.
+   */
+  maxBuffer?: number;
 }
 
 export async function runShell(
@@ -18,7 +25,7 @@ export async function runShell(
   args: string[] = [],
   options: ShellRunOptions = {},
 ): Promise<ShellResult> {
-  const { timeoutMs = 60_000, cwd, env } = options;
+  const { timeoutMs = 60_000, cwd, env, maxBuffer } = options;
   const start = Date.now();
   try {
     const result = await execa(command, args, {
@@ -26,6 +33,7 @@ export async function runShell(
       cwd,
       env,
       reject: false,
+      ...(maxBuffer !== undefined ? { maxBuffer } : {}),
     });
     return {
       stdout: typeof result.stdout === "string" ? result.stdout : "",

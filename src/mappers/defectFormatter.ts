@@ -1,10 +1,15 @@
 import type {
   LighthouseAuditRef,
   Pa11yViolation,
+  TrivyMisconfiguration,
+  TrivySecret,
 } from "../utils/outputParsers.js";
+import type { RemediationGroup } from "./vulnAggregator.js";
 import {
   lighthouseImpactToPriority,
   staticAnalysisToPriority,
+  trivyMisconfigToPriority,
+  trivyVulnToPriority,
   wcagConformanceToPriority,
 } from "./priorityMapper.js";
 import { criterionByNumber, type TargetLevel } from "./wcagLevels.js";
@@ -527,6 +532,196 @@ export function formatA11yFinding(
       rule_code: violation.code,
       selector: violation.selector,
       ...wcagEvidence,
+    },
+  };
+}
+
+// --- Trivy ---
+
+const MAX_SHOWN_VERSIONS = 3;
+
+/** Upstream text arrives with and without terminal punctuation; normalise. */
+function sentence(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+/**
+ * A remediation group → a defect ticket.
+ *
+ * The title names the action, not the CVE. "Upgrade axios 1.5.0 → 1.6.2" is
+ * something a developer can close; "CVE-2023-45857" is something they have to
+ * go and look up first. The CVE list survives in evidence, where it belongs.
+ */
+export function formatTrivyVulnFinding(group: RemediationGroup): Finding {
+  const priority = trivyVulnToPriority({
+    severity: group.maxSeverity,
+    unfixable: false,
+    relationship: group.relationship,
+    dev: group.dev,
+    joined: group.joined,
+  });
+
+  const n = group.cveIds.length;
+  const clears = n === 1 ? "clears 1 CVE" : `clears ${n} CVEs`;
+  const upgrade = group.recommendedVersion
+    ? `${group.installedVersion} → ${group.recommendedVersion}`
+    : group.installedVersion;
+
+  return {
+    priority,
+    title: `[${group.pkgName}] Upgrade ${upgrade} — ${clears}`,
+    description: buildVulnDescription(group),
+    evidence: {
+      package: `${group.pkgName}@${group.installedVersion}`,
+      ...(group.recommendedVersion ? { fixed_version: group.recommendedVersion } : {}),
+      // An audit trail for the recommendation, not the whole ladder. A single
+      // package routinely carries a dozen distinct fixed versions across its
+      // advisories (axios 0.21.0 returned seventeen), and printing all of them
+      // buries the one number that matters. The highest few are enough to see
+      // that the recommendation is the top of the range.
+      ...(group.allFixedVersions.length > 1
+        ? {
+            fixed_version_count: group.allFixedVersions.length,
+            highest_fixed_versions: group.allFixedVersions.slice(-MAX_SHOWN_VERSIONS),
+          }
+        : {}),
+      relationship: group.relationship,
+      ...(group.dev ? { dev_dependency: true } : {}),
+      ...(group.joined ? {} : { relationship_unknown: true }),
+      // Not `cve_ids`: Trivy returns GHSA identifiers alongside CVEs for
+      // several ecosystems (follow-redirects came back with
+      // GHSA-r4q5-vmmm-2653 among four CVEs), so naming the field for one
+      // scheme would be wrong about the contents.
+      advisory_ids: group.cveIds,
+      max_severity: group.maxSeverity,
+      target: group.target,
+      source: "trivy",
+    },
+  };
+}
+
+function buildVulnDescription(group: RemediationGroup): string {
+  const n = group.cveIds.length;
+  const parts: string[] = [];
+
+  if (group.recommendedVersion) {
+    parts.push(
+      `Upgrade ${group.pkgName} from ${group.installedVersion} to ${group.recommendedVersion}.`,
+    );
+  } else {
+    parts.push(`${group.pkgName} ${group.installedVersion} carries known vulnerabilities.`);
+  }
+
+  const worst = group.maxSeverity.toLowerCase();
+  parts.push(
+    n === 1
+      ? `This clears one ${worst}-severity advisory.`
+      : `This clears ${n} advisories, the most severe rated ${worst}.`,
+  );
+
+  if (group.titles.length > 0) {
+    const shown = group.titles.join("; ");
+    parts.push(n > group.titles.length ? `Includes: ${shown}.` : `Covers: ${shown}.`);
+  }
+
+  // The remediability sentence — why this ranks where it does. A reader who
+  // disagrees with the tier can see the reasoning rather than the number.
+  if (!group.joined) {
+    parts.push(
+      `Trivy did not report whether this package is a direct or transitive dependency, so the finding is ranked on severity alone — confirm the dependency path before scheduling it.`,
+    );
+  } else if (group.dev) {
+    parts.push(
+      `This is a devDependency, so the vulnerable code does not ship to production; it is ranked below runtime findings of the same severity but still runs on developer machines and in CI.`,
+    );
+  } else if (
+    group.relationship === "direct" ||
+    group.relationship === "root" ||
+    group.relationship === "workspace"
+  ) {
+    parts.push(
+      `${group.pkgName} is a direct dependency, so the vulnerable code path ships and the fix is a version bump in your own manifest.`,
+    );
+  } else {
+    parts.push(
+      `${group.pkgName} is a transitive dependency, so the fix needs a version override or an upstream release rather than a direct bump — expect it to take longer than the version numbers suggest.`,
+    );
+  }
+
+  return parts.join(" ");
+}
+
+/**
+ * A Trivy secret finding → a defect ticket, with nothing quotable in it.
+ *
+ * Only rule metadata and a location reach the output — `TrivySecret` has no
+ * home for the matched text and this function invents none. The description is
+ * assembled from the rule id, the category and the rule's own title, all of
+ * which describe the *kind* of credential rather than the credential.
+ *
+ * Always P1, with no severity arithmetic. A credential committed to the tree
+ * is exploitable by anyone who can read the repository, and it stays
+ * exploitable after deletion because the object remains in git history — which
+ * is why the remediation sentence says rotate first and delete second.
+ */
+export function formatTrivySecretFinding(secret: TrivySecret): Finding {
+  const kind = secret.title || secret.ruleId || "credential";
+  return {
+    priority: "P1",
+    title: `[${secret.ruleId || "secret"}] ${kind} committed to the repository`,
+    description:
+      `A ${kind.toLowerCase()} is present in ${secret.target} at line ${secret.startLine}. ` +
+      `Anyone with read access to this repository has it, and deleting the line does not revoke it — ` +
+      `the value stays recoverable from git history. Rotate the credential at its source first, ` +
+      `then remove it from the tree and move it to the environment. ` +
+      `The value itself is deliberately not reproduced in this report.`,
+    evidence: {
+      file: secret.target,
+      start_line: secret.startLine,
+      end_line: secret.endLine,
+      rule_id: secret.ruleId,
+      category: secret.category,
+      source: "trivy",
+    },
+  };
+}
+
+/**
+ * A Trivy misconfiguration → a defect ticket.
+ *
+ * Trivy's `Message` states what is wrong with the resource and `Resolution`
+ * states what to change, which together are already close to ticket prose —
+ * so unlike the ESLint and Lighthouse mappers this one leans on upstream text
+ * rather than re-authoring it per rule. There are several thousand Trivy
+ * misconfiguration checks; a hand-written table would cover a fraction of them
+ * and silently fall back for the rest.
+ */
+export function formatTrivyMisconfigFinding(mc: TrivyMisconfiguration): Finding {
+  const where = mc.resource ? `${mc.target} (${mc.resource})` : mc.target;
+  const parts: string[] = [];
+
+  parts.push(sentence(mc.message || mc.description || `${mc.title} failed in ${where}`));
+  if (mc.resolution) parts.push(`Resolution: ${sentence(mc.resolution)}`);
+  parts.push(
+    `Declared in ${where}${mc.startLine !== null ? ` at line ${mc.startLine}` : ""}. ` +
+      `This is a configuration defect rather than an observed failure — it describes how the ` +
+      `infrastructure is set up, so it will not appear in functional testing.`,
+  );
+
+  return {
+    priority: trivyMisconfigToPriority(mc.severity),
+    title: `[${mc.avdId || mc.id}] ${mc.title}`,
+    description: parts.join(" "),
+    evidence: {
+      file: mc.target,
+      ...(mc.startLine !== null ? { start_line: mc.startLine } : {}),
+      ...(mc.resource ? { resource: mc.resource } : {}),
+      check_id: mc.avdId || mc.id,
+      check_type: mc.type,
+      severity: mc.severity,
+      source: "trivy",
     },
   };
 }
