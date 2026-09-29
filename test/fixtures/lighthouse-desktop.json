@@ -1,0 +1,20 @@
+{
+  "categories": {
+    "performance": { "score": 0.85, "auditRefs": [
+      { "id": "largest-contentful-paint", "weight": 25 },
+      { "id": "total-blocking-time", "weight": 30 }
+    ] },
+    "accessibility": { "score": 0.73, "auditRefs": [
+      { "id": "image-alt", "weight": 10 },
+      { "id": "color-contrast", "weight": 7 }
+    ] },
+    "seo": { "score": 0.9, "auditRefs": [] }
+  },
+  "audits": {
+    "server-response-time": { "score": 1, "numericValue": 120.4 },
+    "largest-contentful-paint": { "title": "Largest Contentful Paint", "score": 0.8, "displayValue": "2.9 s", "numericValue": 2900 },
+    "total-blocking-time": { "title": "Total Blocking Time", "score": 0.95, "displayValue": "90 ms" },
+    "image-alt": { "title": "Image elements do not have [alt] attributes", "score": 0, "scoreDisplayMode": "binary" },
+    "color-contrast": { "title": "Background and foreground colors do not have a sufficient contrast ratio.", "score": 0, "scoreDisplayMode": "binary" }
+  }
+}

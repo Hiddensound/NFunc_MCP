@@ -10,7 +10,8 @@
   "files": [
     "dist",
     "docs",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=18.0.0"
@@ -19,6 +20,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc && mkdir -p dist/config && cp src/config/*.js dist/config/",
     "start": "node dist/index.js",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "prepare": "npm run build"
   },
   "keywords": [

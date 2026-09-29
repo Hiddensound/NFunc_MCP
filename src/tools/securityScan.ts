@@ -17,6 +17,10 @@ import {
 import { securitySubScore } from "../mappers/compositeScore.js";
 import { sortFindingsByPriority } from "../mappers/priorityMapper.js";
 import type { Finding, Priority } from "../types.js";
+import { fileFindingId, withIds } from "../mappers/findingId.js";
+import { diffSummary, tagInDiff } from "../mappers/diffTagger.js";
+import { notInstalled } from "../utils/unavailable.js";
+import { changedFilesInput } from "./staticAnalysis.js";
 
 const PRIORITY_ORDER: Record<Priority, number> = { P1: 0, P2: 1, P3: 2 };
 
@@ -42,6 +46,12 @@ const inputShape = {
     .array(z.string())
     .optional()
     .describe("Directories or glob patterns to skip, e.g. ['dist', 'fixtures']"),
+  changed_files: changedFilesInput.describe(
+    "Files changed in the diff under review, relative to `path`. When given, every finding " +
+      "carries `in_diff`: secrets and misconfigurations by their file, vulnerabilities by the " +
+      "lockfile Trivy attributes them to (or that lockfile's manifest, e.g. package.json). " +
+      "The report adds `diff_summary`. Nothing is filtered out.",
+  ),
 };
 
 export function registerSecurityScanTool(server: McpServer): void {
@@ -58,7 +68,7 @@ export function registerSecurityScanTool(server: McpServer): void {
         "Trivy is reported as a warning rather than an error.",
       inputSchema: inputShape,
     },
-    async ({ path: targetPath, scanners, min_severity, skip_dirs }) => {
+    async ({ path: targetPath, scanners, min_severity, skip_dirs, changed_files }) => {
       const absPath = resolve(targetPath);
       const activeScanners: TrivyScanner[] =
         scanners && scanners.length > 0 ? scanners : DEFAULT_SCANNERS;
@@ -82,6 +92,7 @@ export function registerSecurityScanTool(server: McpServer): void {
           scanners: activeScanners,
           issue_count: 0,
           findings: [],
+          ...(run.notInstalled ? { unavailable: [notInstalled("trivy")] } : {}),
           warnings,
         });
       }
@@ -105,11 +116,18 @@ export function registerSecurityScanTool(server: McpServer): void {
 
       const { fixable, unfixable } = aggregateVulnerabilities(parsed.vulnerabilities);
 
-      const findings: Finding[] = [
-        ...parsed.secrets.map(formatTrivySecretFinding),
-        ...fixable.map(formatTrivyVulnFinding),
-        ...parsed.misconfigurations.map(formatTrivyMisconfigFinding),
-      ];
+      const findings: Finding[] = tagInDiff(
+        withIds(
+          [
+            ...parsed.secrets.map(formatTrivySecretFinding),
+            ...fixable.map(formatTrivyVulnFinding),
+            ...parsed.misconfigurations.map(formatTrivyMisconfigFinding),
+          ],
+          (f) => fileFindingId(f, absPath),
+        ),
+        changed_files,
+        absPath,
+      );
 
       sortFindingsByPriority(findings);
       // Stable secondary ordering so two runs over an unchanged tree produce
@@ -117,7 +135,8 @@ export function registerSecurityScanTool(server: McpServer): void {
       findings.sort(
         (a, b) =>
           PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority] ||
-          a.title.localeCompare(b.title),
+          a.title.localeCompare(b.title) ||
+          (a.id ?? "").localeCompare(b.id ?? ""),
       );
 
       // A join miss means a finding was priced on severity alone. That is a
@@ -138,6 +157,7 @@ export function registerSecurityScanTool(server: McpServer): void {
         ...(dbDate ? { db_status: { trivy_db_updated_at: dbDate } } : {}),
         scores: { security: securitySubScore(findings) },
         issue_count: findings.length,
+        ...(changed_files ? { diff_summary: diffSummary(findings) } : {}),
         counts: {
           vulnerabilities: parsed.vulnerabilities.length,
           secrets: parsed.secrets.length,

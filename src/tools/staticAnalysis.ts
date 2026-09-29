@@ -1,40 +1,38 @@
 import { z } from "zod";
 import { resolve } from "path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runShell } from "../utils/shellRunner.js";
-import { parseSemgrepJSON } from "../utils/outputParsers.js";
-import { runESLint } from "../utils/eslintRunner.js";
-import {
-  formatStaticAnalysisFinding,
-  type StaticAnalysisIssue,
-} from "../mappers/defectFormatter.js";
-import type { Finding } from "../types.js";
-import type { Priority } from "../mappers/priorityMapper.js";
+import { runStaticAnalysis } from "../utils/staticRunner.js";
+import { diffSummary, tagInDiff } from "../mappers/diffTagger.js";
 
-const PRIORITY_ORDER: Record<Priority, number> = { P1: 0, P2: 1, P3: 2 };
-
-function higherPriority(a: Finding, b: Finding): Finding {
-  return PRIORITY_ORDER[a.priority] <= PRIORITY_ORDER[b.priority] ? a : b;
-}
-
-function isSemgrepNotInstalled(stderr: string, stdout: string, exitCode: number): boolean {
-  if (exitCode !== -1) return false;
-  if (!stderr && !stdout) return true;
-  return (
-    stderr.includes("ENOENT") ||
-    stderr.includes("not found") ||
-    stderr.includes("command not found") ||
-    stderr.includes("No such file")
+export const changedFilesInput = z
+  .array(z.string())
+  .optional()
+  .describe(
+    "Files changed in the diff under review, relative to `path` (e.g. the output of " +
+      "`git diff --name-only main...HEAD`). When given, every file-based finding carries " +
+      "`in_diff: true|false` and the report adds `diff_summary` counts. Nothing is filtered out.",
   );
-}
+
+export const rulesetInput = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .describe(
+    "Semgrep ruleset(s) — registry ids like 'p/python' or local rule files/directories. " +
+      "A string may be comma-separated. Overrides `language`. Default: p/javascript + p/typescript. " +
+      "Registry rulesets need network access to semgrep.dev.",
+  );
 
 const inputShape = {
   path: z.string().describe("Absolute or relative path to the directory to analyse"),
-  ruleset: z
-    .string()
+  ruleset: rulesetInput,
+  language: z
+    .enum(["js", "ts", "python"])
     .optional()
-    .describe("Semgrep ruleset override (default: p/javascript + p/typescript)"),
-  language: z.enum(["js", "ts", "python"]).optional().describe("Language hint"),
+    .describe(
+      "Picks the default Semgrep rulesets when `ruleset` is not given: 'js' → p/javascript, " +
+        "'ts' → p/javascript + p/typescript (same as unset), 'python' → p/python and ESLint is skipped.",
+    ),
+  changed_files: changedFilesInput,
 };
 
 export function registerStaticAnalysisTool(server: McpServer): void {
@@ -44,89 +42,30 @@ export function registerStaticAnalysisTool(server: McpServer): void {
       description:
         "Runs ESLint and Semgrep in parallel against a local directory and returns a " +
         "QA-style report with prioritised findings (P1/P2/P3). " +
-        "Requires ESLint and Semgrep to be installed on PATH. " +
+        "Requires ESLint and Semgrep to be installed on PATH; a missing one is listed in " +
+        "`unavailable` with its install command. " +
         "When the target directory has no ESLint config the QA MCP baseline is used as fallback; " +
-        "eslint_config_used in the response always states which config was applied.",
+        "eslint_config_used in the response always states which config was applied. " +
+        "Pass changed_files to tag each finding in_diff for pre-merge review.",
       inputSchema: inputShape,
     },
-    async ({ path: targetPath, ruleset }) => {
+    async ({ path: targetPath, ruleset, language, changed_files }) => {
       const absPath = resolve(targetPath);
-
-      // --- Semgrep args ---
-      const semgrepRulesets = ruleset
-        ? [`--config=${ruleset}`]
-        : ["--config=p/javascript", "--config=p/typescript"];
-      const semgrepArgs = [...semgrepRulesets, "--json", "--exclude", "node_modules", "."];
-
-      // Run ESLint (per-package aware) and Semgrep in parallel.
-      const [eslintRun, semgrepResult] = await Promise.all([
-        runESLint(absPath),
-        runShell("semgrep", semgrepArgs, { timeoutMs: 180_000, cwd: absPath }),
-      ]);
-
-      const toolsRun: string[] = [];
-      const warnings: string[] = [...eslintRun.warnings];
-      const allIssues: StaticAnalysisIssue[] = [...eslintRun.issues];
-
-      if (eslintRun.ran) toolsRun.push("eslint");
-
-      // --- Semgrep ---
-      if (isSemgrepNotInstalled(semgrepResult.stderr, semgrepResult.stdout, semgrepResult.exitCode)) {
-        warnings.push("Semgrep is not installed or not found in PATH — skipping Semgrep analysis.");
-      } else if (semgrepResult.exitCode === 2) {
-        warnings.push(`Semgrep error: ${semgrepResult.stderr.slice(0, 500)}`);
-      } else if (semgrepResult.stdout) {
-        try {
-          for (const finding of parseSemgrepJSON(semgrepResult.stdout).findings) {
-            allIssues.push({
-              source: "semgrep",
-              file: finding.filePath,
-              line: finding.line,
-              ruleId: finding.ruleId,
-              message: finding.message,
-              severity: finding.severity,
-              category: finding.category,
-            });
-          }
-          toolsRun.push("semgrep");
-        } catch {
-          warnings.push("Failed to parse Semgrep JSON output.");
-        }
-      } else {
-        toolsRun.push("semgrep");
-      }
-
-      // --- Format findings ---
-      const formatted: Finding[] = [];
-      for (const issue of allIssues) {
-        const finding = formatStaticAnalysisFinding(issue);
-        if (finding) formatted.push(finding);
-      }
-
-      // --- Deduplicate: same file:line → keep highest priority ---
-      const dedupMap = new Map<string, Finding>();
-      for (const f of formatted) {
-        const key = `${String(f.evidence["file"])}:${String(f.evidence["line"])}`;
-        const existing = dedupMap.get(key);
-        dedupMap.set(key, existing ? higherPriority(existing, f) : f);
-      }
-
-      // --- Sort: priority first, then file path ---
-      const findings = Array.from(dedupMap.values()).sort((a, b) => {
-        const pDiff = PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority];
-        if (pDiff !== 0) return pDiff;
-        return String(a.evidence["file"]).localeCompare(String(b.evidence["file"]));
-      });
+      const run = await runStaticAnalysis(absPath, { ruleset, language });
+      const findings = tagInDiff(run.findings, changed_files, absPath);
 
       const report: Record<string, unknown> = {
         path: absPath,
-        tools_run: toolsRun,
-        eslint_config_used: eslintRun.config_used,
+        tools_run: run.tools_run,
+        eslint_config_used: run.eslint_config_used,
+        semgrep_rulesets: run.rulesets,
         issue_count: findings.length,
+        ...(changed_files ? { diff_summary: diffSummary(findings) } : {}),
         findings,
       };
-      if (eslintRun.packages.length > 0) report["eslint_packages"] = eslintRun.packages;
-      if (warnings.length > 0) report["warnings"] = warnings;
+      if (run.eslint_packages.length > 0) report["eslint_packages"] = run.eslint_packages;
+      if (run.unavailable.length > 0) report["unavailable"] = run.unavailable;
+      if (run.warnings.length > 0) report["warnings"] = run.warnings;
 
       return {
         content: [{ type: "text", text: JSON.stringify(report, null, 2) }],

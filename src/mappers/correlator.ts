@@ -1,4 +1,5 @@
 import type { Finding, Priority } from "../types.js";
+import { findingId } from "./findingId.js";
 
 export interface CorrelatedFinding extends Finding {
   id: string;
@@ -102,35 +103,32 @@ const PERFORMANCE_AUDIT_IDS = new Set([
   "total-blocking-time",
 ]);
 
-// Deterministic non-crypto string hash (djb2), base36-encoded.
-// Selectors are long and routinely share long prefixes — e.g.
-// "#accordion-panel-:rn: > div > div > input:nth-child(1)" and the same
-// selector ending ":nth-child(3)" are identical for their first 40 characters.
-// The previous id truncated the selector to 16 chars, so those two distinct
-// findings collapsed to one id and consumedA11yIds claimed the wrong entry
-// during correlation. Hashing the whole selector keeps ids short and unique.
-function shortHash(input: string): string {
-  let h = 5381;
-  for (let i = 0; i < input.length; i++) {
-    h = ((h << 5) + h + input.charCodeAt(i)) | 0;
-  }
-  return (h >>> 0).toString(36);
-}
-
-function makeId(tool: string, f: Finding): string {
+// Fallback only. Every tool now assigns a stable id (src/mappers/findingId.ts)
+// before findings reach the correlator; this covers a caller that has not.
+function fallbackId(tool: string, f: Finding): string {
   const e = f.evidence;
-  if (tool === "lighthouse") return `lh:${String(e["audit_id"] ?? f.title)}`;
-  if (tool === "a11y") {
-    const code = String(e["rule_code"] ?? "").split(".").slice(-2).join(".");
-    return `a11y:${code}:${shortHash(String(e["selector"] ?? ""))}`;
+  if (tool === "lighthouse") {
+    return findingId({ tool: "lighthouse", rule: String(e["audit_id"] ?? f.title), location: "" });
   }
-  const basename = String(e["file"] ?? "").split("/").pop() ?? "";
-  return `static:${String(e["source"] ?? "")}:${basename}:${String(e["line"] ?? "")}`;
+  if (tool === "a11y") {
+    return findingId({ tool: "pa11y", rule: String(e["rule_code"] ?? ""), location: String(e["selector"] ?? "") });
+  }
+  return findingId({
+    tool: String(e["source"] ?? "static"),
+    rule: String(e["rule_id"] ?? f.title),
+    location: `${String(e["file"] ?? "")}:${String(e["line"] ?? "")}`,
+  });
 }
 
 function tag(tool: string, findings: Finding[]): CorrelatedFinding[] {
-  return findings.map((f) => ({ ...f, id: makeId(tool, f), source_tool: tool }));
+  return findings.map((f) => ({ ...f, id: f.id ?? fallbackId(tool, f), source_tool: tool }));
 }
+
+const FORM_FACTOR_KEYS = [
+  "priority_by_form_factor",
+  "affects_form_factors",
+  "form_factor_specific",
+] as const;
 
 // Rule 1 — Double-confirmed accessibility:
 // A Lighthouse accessibility finding and a pa11y finding that cover the same
@@ -139,6 +137,7 @@ function tag(tool: string, findings: Finding[]): CorrelatedFinding[] {
 function applyRule1(
   lhFindings: CorrelatedFinding[],
   a11yFindings: CorrelatedFinding[],
+  url: string | undefined,
 ): {
   correlated: CorrelatedFinding[];
   consumedLhIds: Set<string>;
@@ -182,8 +181,10 @@ function applyRule1(
       0,
     );
 
-    correlated.push({
-      id: `corr:lh+a11y:${auditId}`,
+    const corr: CorrelatedFinding = {
+      // Keyed on the audit alone: which pa11y elements it absorbed can vary
+      // between runs, but "Lighthouse and pa11y agree on this audit" cannot.
+      id: findingId({ tool: "lighthouse+pa11y", rule: auditId, location: "", url }),
       source_tool: "lighthouse+pa11y",
       priority: promotePriority(basePriority),
       title: lhF.title,
@@ -204,7 +205,14 @@ function applyRule1(
         pa11y_elements_affected: elementCount,
       },
       confirmed_by: ["lighthouse", "pa11y"],
-    });
+    };
+    // The Lighthouse side's per-profile breakdown survives the merge, so a
+    // corroborated finding still says which form factors it was seen on.
+    for (const key of FORM_FACTOR_KEYS) {
+      const value = (lhF as unknown as Record<string, unknown>)[key];
+      if (value !== undefined) (corr as unknown as Record<string, unknown>)[key] = value;
+    }
+    correlated.push(corr);
 
     consumedLhIds.add(lhF.id);
     for (const m of matches) consumedA11yIds.add(m.id);
@@ -245,7 +253,10 @@ function applyRule2(
   });
 }
 
-export function correlate(reports: ToolReports): CorrelatorResult {
+export function correlate(
+  reports: ToolReports,
+  options: { url?: string } = {},
+): CorrelatorResult {
   const lhTagged = tag("lighthouse", reports.lighthouse?.findings ?? []);
   const a11yTagged = tag("a11y", reports.a11y?.findings ?? []);
   const staticTagged = tag("static", reports.static?.findings ?? []);
@@ -253,6 +264,7 @@ export function correlate(reports: ToolReports): CorrelatorResult {
   const { correlated, consumedLhIds, consumedA11yIds } = applyRule1(
     lhTagged,
     a11yTagged,
+    options.url,
   );
 
   const remainingLh = applyRule2(

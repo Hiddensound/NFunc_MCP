@@ -48,6 +48,8 @@ export interface TrivyRun {
   stdout: string;
   warnings: string[];
   durationMs: number;
+  /** The trivy binary could not be spawned. */
+  notInstalled?: boolean;
 }
 
 /**
@@ -160,6 +162,7 @@ export async function runTrivyFs(
         `Trivy is not installed or not found in PATH — skipping security scan. Install with: ${trivyInstallHint()}`,
       ],
       durationMs: result.durationMs,
+      notInstalled: true,
     };
   }
 

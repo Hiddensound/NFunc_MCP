@@ -1,10 +1,11 @@
-import { writeFile } from "fs/promises";
+import { mkdir, writeFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, resolve } from "path";
 
 export interface ReportData {
   url?: string;
   path?: string;
+  context?: string;
   release_readiness: string;
   composite_score: number;
   scorecard: Array<{
@@ -251,6 +252,9 @@ export function buildReportHtml(data: ReportData): string {
         ${isUrl ? `<a href="${esc(data.url)}" style="color:#7dd3fc" target="_blank">${esc(target)}</a>`
                 : `<code style="color:#7dd3fc">${esc(target)}</code>`}
       </div>
+      ${data.context
+        ? `<div style="margin-top:2px;font-size:12px;color:#94a3b8">${esc(data.context)}</div>`
+        : ""}
     </div>
     <div style="font-size:12px;color:#64748b">${esc(data.generated_at)}</div>
   </div>
@@ -315,15 +319,36 @@ export function buildReportHtml(data: ReportData): string {
 </html>`;
 }
 
-export async function generateHtmlReport(data: ReportData): Promise<string> {
+/**
+ * Writes the HTML report, and optionally a JSON copy of the tool result beside
+ * it. `outputDir` unset keeps the historical behaviour: HTML only, in the OS
+ * temp directory.
+ */
+export async function generateHtmlReport(
+  data: ReportData,
+  options: {
+    outputDir?: string;
+    /** Builds the JSON copy; receives both paths so the copy can reference them. */
+    json?: (paths: { html: string; json: string }) => unknown;
+  } = {},
+): Promise<{ html: string; json?: string }> {
   const timestamp = Date.now();
   const host = (data.url
     ? new URL(data.url).hostname
     : String(data.path ?? "local").split("/").pop() ?? "local"
   ).replace(/[^a-z0-9]/gi, "-").toLowerCase();
 
-  const filename = `qa-report-${host}-${timestamp}.html`;
-  const filepath = join(tmpdir(), filename);
-  await writeFile(filepath, buildReportHtml(data), "utf8");
-  return filepath;
+  const dir = options.outputDir ? resolve(options.outputDir) : tmpdir();
+  if (options.outputDir) await mkdir(dir, { recursive: true });
+
+  const base = `qa-report-${host}-${timestamp}`;
+  const html = join(dir, `${base}.html`);
+  await writeFile(html, buildReportHtml(data), "utf8");
+
+  if (options.outputDir && options.json !== undefined) {
+    const json = join(dir, `${base}.json`);
+    await writeFile(json, JSON.stringify(options.json({ html, json }), null, 2), "utf8");
+    return { html, json };
+  }
+  return { html };
 }

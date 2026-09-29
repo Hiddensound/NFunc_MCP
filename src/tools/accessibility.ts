@@ -11,6 +11,7 @@ import {
 } from "../utils/toolResponse.js";
 import { formatA11yFinding } from "../mappers/defectFormatter.js";
 import { dedupeA11yFindings } from "../mappers/a11yDedupe.js";
+import { a11yFindingId, withIds } from "../mappers/findingId.js";
 import { sortFindingsByPriority } from "../mappers/priorityMapper.js";
 import type { Finding } from "../types.js";
 import { resolveUrlInputs } from "../utils/urlInput.js";
@@ -125,7 +126,7 @@ interface A11yOutcome {
 
 /** Path to a pa11y config carrying a mobile viewport, written once per process. */
 let mobileConfigPath: string | null = null;
-async function mobileConfig(): Promise<string> {
+export async function mobileConfig(): Promise<string> {
   if (mobileConfigPath) return mobileConfigPath;
   const path = join(tmpdir(), `nfunc-pa11y-mobile-${process.pid}.json`);
   await writeFile(path, JSON.stringify(MOBILE_VIEWPORT, null, 2), "utf8");
@@ -187,7 +188,9 @@ async function auditUrl(
   // (rule_code, selector) and the engines emit different code shapes for the
   // same defect, so an element both flag appears twice. Deliberate — two
   // independent engines agreeing is corroboration worth seeing.
-  const { findings, rawCount } = dedupeA11yFindings(rawFindings);
+  const deduped = dedupeA11yFindings(rawFindings);
+  const rawCount = deduped.rawCount;
+  const findings = withIds(deduped.findings, (f) => a11yFindingId(f, url));
   sortFindingsByPriority(findings);
   return {
     findings,

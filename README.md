@@ -113,7 +113,21 @@ Plan a PageSpeed Insights audit for https://myapp.com
 ```
 
 `run_qa_gate` returns a `report_file` path — open it in a browser for the
-visual dashboard.
+visual dashboard. Pass `output_dir` to keep the HTML and a JSON copy somewhere
+other than the temp directory.
+
+### Pre-merge review
+
+For a gate that runs before a PR is opened, `run_qa_gate`,
+`run_static_analysis` and `run_security_scan` take `changed_files` (paths
+relative to `path`, e.g. from `git diff --name-only main...HEAD`). Every
+file-based finding is tagged `in_diff: true | false` — nothing is filtered —
+and the report adds per-tier `diff_summary` counts. Every finding carries a
+stable `id`, so a re-run after a fix can confirm that exact finding is gone.
+With `form_factor: "both"`, desktop is primary by default: findings only
+mobile reports drop one tier, and both raw priorities stay on the finding. A
+CLI that cannot run is listed in `unavailable` with its install command. See
+the [manual](docs/manual.md#run_qa_gate-reference) for the full shapes.
 
 ---
 
