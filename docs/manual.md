@@ -21,25 +21,37 @@ tools are and how to ask for them; this covers how to run and interpret them.
 
 ## Prerequisites
 
-Five of the tools wrap CLIs. Install the ones you need:
+**Node 22.19+ or 24+** (Node 23 is not supported — pa11y 10 excludes it).
+
+Five of the tools wrap CLIs. Three ship with the package:
 
 | Tool | Install | Used by |
 |---|---|---|
-| Lighthouse | `npm install -g lighthouse` | `run_lighthouse`, `run_qa_gate` (URL) |
-| pa11y | `npm install -g pa11y` | `run_accessibility_check`, `run_qa_gate` (URL) |
-| ESLint | `npm install -g eslint` | `run_static_analysis`, `run_qa_gate` (path) |
+| Lighthouse 13 | **Bundled** | `run_lighthouse`, `run_qa_gate` (URL) |
+| pa11y 10 | **Bundled** (its install downloads a headless Chrome, ~150 MB, into `~/.cache/puppeteer`) | `run_accessibility_check`, `run_qa_gate` (URL) |
+| ESLint 10 | **Bundled** — a project's own ESLint is still preferred | `run_static_analysis`, `run_qa_gate` (path) |
 | Semgrep | `brew install semgrep` or `pip install semgrep` | `run_static_analysis`, `run_qa_gate` (path) |
 | Trivy | `brew install trivy`, `choco install trivy`, or [apt/yum/apk](https://trivy.dev/latest/getting-started/installation/) | `run_security_scan` |
 
-Verify:
+Lighthouse drives a Chrome it finds on the machine (or `CHROME_PATH`); it does
+not use pa11y's downloaded one.
+
+**How a binary is found.** In order: for ESLint only, the scanned project's
+`node_modules/.bin` (walking up from `path`, so a repo pinned to ESLint 8 and
+`.eslintrc` keeps its own — the bundled ESLint 10 reads flat config only);
+then this package's `node_modules/.bin`, or the `node_modules/.bin` it is
+installed into, where npm hoists its dependencies; then `PATH`.
+
+Verify with the `check_dependencies` tool, or from a shell:
 
 ```bash
-lighthouse --version && pa11y --version && eslint --version && semgrep --version && trivy --version
+semgrep --version && trivy --version
 ```
 
 **You don't need all five.** A missing tool shows `UNAVAILABLE` in the
-scorecard and its findings are skipped; the gate still runs. URL-only runs need
-Lighthouse and pa11y; path-only runs need ESLint and Semgrep.
+scorecard and in `unavailable`, and its findings are skipped; the gate still
+runs. URL-only runs need Lighthouse and pa11y; path-only runs need ESLint and
+Semgrep.
 
 ### Trivy's vulnerability database
 
@@ -263,7 +275,7 @@ A tool that could not run is listed rather than failing the call:
   { "tool": "semgrep", "binary": "semgrep", "reason": "network",
     "install_hint": "Semgrep downloads registry rulesets (p/javascript, p/typescript) from semgrep.dev ..." },
   { "tool": "eslint", "binary": "eslint", "reason": "not_installed",
-    "install_hint": "npm install --save-dev eslint (in the project) or npm install -g eslint" }
+    "install_hint": "bundled with nfunc-mcp — reinstall it, or npm install --save-dev eslint in the project" }
 ]
 ```
 
@@ -640,6 +652,35 @@ matched value, and never the surrounding source lines, even though Trivy masks
 them. Rotate first: deleting the line does not revoke a credential that is
 still in git history.
 
+### `check_dependencies`
+
+One entry per CLI — lighthouse, pa11y, eslint, semgrep, trivy — each probed
+with `--version`:
+
+```jsonc
+{
+  "node_version": "v22.23.1",
+  "all_found": true,
+  "dependencies": [
+    { "tool": "lighthouse", "binary": "lighthouse", "found": true, "version": "13.5.0",
+      "source": "bundled", "path": "/…/node_modules/.bin/lighthouse", "install_hint": "…" },
+    { "tool": "semgrep", "binary": "semgrep", "found": true, "version": "1.176.0",
+      "source": "path", "path": "semgrep", "install_hint": "brew install semgrep" },
+    { "tool": "trivy", "binary": "trivy", "found": true, "version": "0.74.0",
+      "source": "path", "path": "trivy", "install_hint": "brew install trivy",
+      "trivy_db_updated_at": "2026-09-29T13:11:12Z", "trivy_db_age_days": 0 }
+  ],
+  "warnings": [ … ]   // only when something is missing or stale
+}
+```
+
+`source` is `bundled`, `path`, or — for ESLint when the optional `path` input
+points at a project with its own ESLint — `project`; `null` when not found.
+`install_hint` is always present. `trivy_db_age_days` is `null` when Trivy has
+no database yet; above 7 days a warning says the scan may be falsely clean,
+since Trivy refreshes daily when it can reach its registry. `run_security_scan`
+also reports `db_status.trivy_db_age_days`.
+
 ### Auditing several URLs at once
 
 `run_lighthouse` and `run_accessibility_check` both accept three input shapes in
@@ -940,6 +981,7 @@ Adjustments:
 │   │   ├── accessibility.ts
 │   │   ├── staticAnalysis.ts
 │   │   ├── securityScan.ts          # run_security_scan (Trivy)
+│   │   ├── checkDependencies.ts     # check_dependencies
 │   │   ├── performanceAuditPlan.ts  # plan_performance_audit
 │   │   └── performanceAudit.ts      # run_performance_audit
 │   ├── mappers/                     # Raw output → QA report shape
@@ -974,6 +1016,7 @@ Adjustments:
 │       ├── batchState.ts            # Cursor, budget, index merge, gap-fill
 │       ├── staticRunner.ts          # ESLint + Semgrep, shared by gate and tool
 │       ├── unavailable.ts           # Missing-binary detection + install hints
+│       ├── binaryResolver.ts        # project → bundled → PATH binary lookup
 │       ├── eslintConfigDetector.ts
 │       └── toolResponse.ts
 ├── test/                            # node:test unit tests + fixtures/ (npm test)

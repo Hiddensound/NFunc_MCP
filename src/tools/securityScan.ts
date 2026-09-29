@@ -21,6 +21,7 @@ import { fileFindingId, withIds } from "../mappers/findingId.js";
 import { diffSummary, tagInDiff } from "../mappers/diffTagger.js";
 import { notInstalled } from "../utils/unavailable.js";
 import { changedFilesInput } from "./staticAnalysis.js";
+import { dbAgeDays } from "./checkDependencies.js";
 
 const PRIORITY_ORDER: Record<Priority, number> = { P1: 0, P2: 1, P3: 2 };
 
@@ -154,7 +155,9 @@ export function registerSecurityScanTool(server: McpServer): void {
         path: absPath,
         tools_run: ["trivy"],
         scanners: activeScanners,
-        ...(dbDate ? { db_status: { trivy_db_updated_at: dbDate } } : {}),
+        ...(dbDate
+          ? { db_status: { trivy_db_updated_at: dbDate, trivy_db_age_days: dbAgeDays(dbDate) } }
+          : {}),
         scores: { security: securitySubScore(findings) },
         issue_count: findings.length,
         ...(changed_files ? { diff_summary: diffSummary(findings) } : {}),

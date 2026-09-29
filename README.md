@@ -37,14 +37,19 @@ is ever reported.
 claude mcp add nfunc-mcp -- npx -y nfunc-mcp
 ```
 
-Then install whichever CLIs you need — `lighthouse`, `pa11y`, `eslint`,
-`semgrep`, `trivy`. Missing tools are skipped rather than fatal, so start with
-what you have. Trivy also wants a one-time database download
+Requires **Node 22.19+ or 24+**. Lighthouse, pa11y and ESLint are bundled —
+nothing to install for URL checks or linting. pa11y's install downloads a
+headless Chrome (~150 MB, into `~/.cache/puppeteer`) the first time. Semgrep
+and Trivy are not npm packages; install them if you want code-pattern and
+security scans (`brew install semgrep trivy`). Missing tools are skipped rather
+than fatal. Trivy also wants a one-time database download
 (`trivy fs --download-db-only`, ~113 MB) before its first scan. For real-user
 field data, add a
 [PageSpeed Insights key](docs/manual.md#pagespeed-insights-api-key).
 
-Verify with `/mcp`, then ask Claude to *"call the nfunc-mcp ping tool."*
+Verify with `/mcp`, then ask Claude to *"run nfunc-mcp check_dependencies"* —
+it reports each CLI's version, where it resolved from, and how old Trivy's
+database is.
 
 [Other install options →](docs/manual.md#install-and-register)
 
@@ -61,6 +66,7 @@ Verify with `/mcp`, then ask Claude to *"call the nfunc-mcp ping tool."*
 | `run_security_scan` | Trivy over a local codebase — dependency CVEs, committed secrets, IaC misconfiguration. Vulnerabilities are grouped into **one finding per version bump**, not one per CVE, and ranked on how cheaply they can be fixed rather than on raw severity. CVEs with no upstream fix go to a separate decision queue instead of blocking the work queue. |
 | `plan_performance_audit` | Plans a PageSpeed Insights audit — finds your URLs, groups them into page templates, costs the run. **Spends no quota.** |
 | `run_performance_audit` | Runs it. Lab scores, real-user field data, and the disagreements between them. |
+| `check_dependencies` | Is every CLI available? Version, source (`bundled` / `project` / `path`), install command for anything missing, and `trivy_db_age_days`. |
 | `ping` | Health check. |
 
 ### How they connect

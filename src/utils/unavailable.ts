@@ -20,9 +20,11 @@ export function isNotInstalled(result: ShellResult): boolean {
 }
 
 const HINTS: Record<string, () => string> = {
-  lighthouse: () => "npm install -g lighthouse",
-  pa11y: () => "npm install -g pa11y",
-  eslint: () => "npm install --save-dev eslint (in the project) or npm install -g eslint",
+  // Bundled since 0.8.0 — missing means the install is broken or was made
+  // with --omit / --no-optional, not that the user forgot a global.
+  lighthouse: () => "bundled with nfunc-mcp — reinstall it (npm install -g nfunc-mcp), or npm install -g lighthouse",
+  pa11y: () => "bundled with nfunc-mcp — reinstall it (npm install -g nfunc-mcp), or npm install -g pa11y",
+  eslint: () => "bundled with nfunc-mcp — reinstall it, or npm install --save-dev eslint in the project",
   semgrep: () =>
     process.platform === "darwin" ? "brew install semgrep" : "python3 -m pip install semgrep",
   trivy: trivyInstallHint,

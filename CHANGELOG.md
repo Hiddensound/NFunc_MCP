@@ -3,7 +3,41 @@
 All notable changes to `nfunc-mcp`. Versions match the npm package and the
 `v*` git tags.
 
-## 0.7.0 — 2026-09-29
+## 0.8.0 — 2026-09-29
+
+Bundled browser and lint CLIs, and a dependency check. Includes everything in
+0.7.0, which was tagged but never published to npm.
+
+### Breaking
+
+- **Requires Node `^22.19.0 || >=24`** (was `>=18`). The bundled Lighthouse 13
+  needs Node 22.19+, and pa11y 10 supports `^22.13 || >=24`, which rules out
+  Node 23. CI now runs on Node 22 and 24.
+
+### Added
+
+- **Lighthouse (`^13.5.0`), pa11y (`^10.0.0`) and ESLint (`^10.11.0`) are now
+  dependencies.** Binaries resolve from this package's `node_modules/.bin`, or
+  the enclosing `node_modules/.bin` npm hoists them into, before falling back
+  to `PATH`. ESLint still prefers the scanned project's own binary first, so
+  projects on legacy `.eslintrc` keep their pinned ESLint; the bundled ESLint
+  10 reads flat config only. Installing pa11y downloads a headless Chrome
+  (~150 MB) through puppeteer. Semgrep and Trivy remain `PATH` installs.
+- **`check_dependencies` tool.** Returns
+  `{ tool, binary, found, version, source, path, install_hint }` for
+  lighthouse, pa11y, eslint, semgrep and trivy, where `source` is
+  `"bundled" | "project" | "path" | null`. The trivy entry also carries
+  `trivy_db_updated_at` and `trivy_db_age_days`. It warns when Trivy's database
+  is older than 7 days or missing.
+- `run_security_scan` `db_status` now includes `trivy_db_age_days`.
+
+### Changed
+
+- `unavailable[].install_hint` for lighthouse, pa11y and eslint now says the
+  tool is bundled and suggests a reinstall, with a global install as the
+  fallback.
+
+## 0.7.0 — 2026-09-29 (tagged, not published to npm)
 
 Pre-merge review support: form-factor-aware gating, diff tagging, stable ids,
 and structured reporting of tools that could not run. PSI tools
