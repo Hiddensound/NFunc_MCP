@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, statSync } from "fs";
 import { join, resolve } from "path";
+import { resolveESLint } from "./binaryResolver.js";
 
 // Checked in priority order: flat config first, then legacy formats.
 const CONFIG_FILES = [
@@ -69,19 +70,10 @@ export function discoverESLintPackages(rootPath: string, maxDepth = 3): string[]
 }
 
 /**
- * Resolves the nearest local ESLint binary by walking up from startPath.
- * Using a local binary avoids version mismatches (e.g. project uses v8 but
- * the global ESLint is v9/v10 which dropped .eslintrc.* support).
- * Falls back to the global "eslint" command if no local binary is found.
+ * Project-local ESLint first (walking up from startPath, so a project keeps
+ * the major it is pinned to), then the ESLint bundled with this package, then
+ * PATH. See binaryResolver.
  */
 export function resolveESLintBinary(startPath: string): string {
-  let dir = resolve(startPath);
-  for (let i = 0; i < 7; i++) {
-    const candidate = join(dir, "node_modules", ".bin", "eslint");
-    if (existsSync(candidate)) return candidate;
-    const parent = resolve(join(dir, ".."));
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return "eslint";
+  return resolveESLint(startPath).command;
 }

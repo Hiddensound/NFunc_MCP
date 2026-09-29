@@ -10,6 +10,7 @@ import { registerSecurityScanTool } from "./tools/securityScan.js";
 import { registerQaGateTool } from "./tools/qaGate.js";
 import { registerPerformanceAuditPlanTool } from "./tools/performanceAuditPlan.js";
 import { registerPerformanceAuditTool } from "./tools/performanceAudit.js";
+import { registerCheckDependenciesTool } from "./tools/checkDependencies.js";
 import { redactAll } from "./utils/httpClient.js";
 import { KEY_ENV_VAR } from "./utils/psiAuth.js";
 
@@ -61,6 +62,7 @@ registerSecurityScanTool(server);
 registerQaGateTool(server);
 registerPerformanceAuditPlanTool(server);
 registerPerformanceAuditTool(server);
+registerCheckDependenciesTool(server);
 
 async function main() {
   const transport = new StdioServerTransport();

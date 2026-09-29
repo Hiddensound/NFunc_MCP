@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { runShell, type ShellResult } from "../utils/shellRunner.js";
+import { resolveBinary } from "../utils/binaryResolver.js";
 import { parseLighthouseJSON, type ParsedLighthouse } from "../utils/outputParsers.js";
 import { extractLabMetrics } from "../utils/psiParser.js";
 import { resolveUrlInputs } from "../utils/urlInput.js";
@@ -125,7 +126,7 @@ async function runLighthouseOnce(
   if (categories && categories.length > 0) {
     args.push(`--only-categories=${categories.join(",")}`);
   }
-  const result = await runShell("lighthouse", args, { timeoutMs: 180_000 });
+  const result = await runShell(resolveBinary("lighthouse").command, args, { timeoutMs: 180_000 });
   if (!result.stdout) return { result };
   try {
     return { run: { factor, parsed: parseLighthouseJSON(result.stdout), raw: result.stdout }, result };

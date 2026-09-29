@@ -2,6 +2,7 @@ import { z } from "zod";
 import { resolve } from "path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { runShell } from "../utils/shellRunner.js";
+import { resolveBinary } from "../utils/binaryResolver.js";
 import { parseLighthouseJSON, parsePa11yJSON } from "../utils/outputParsers.js";
 import { formatLighthouseFinding, formatA11yFinding } from "../mappers/defectFormatter.js";
 import { dedupeA11yFindings } from "../mappers/a11yDedupe.js";
@@ -67,7 +68,7 @@ interface LighthouseRun {
 
 async function runLighthouse(url: string, formFactor: FormFactor): Promise<LighthouseRun> {
   const result = await runShell(
-    "lighthouse",
+    resolveBinary("lighthouse").command,
     [
       url,
       "--output=json",
@@ -126,7 +127,7 @@ async function runA11y(
   const results = await Promise.all(
     engines.map((e) =>
       runShell(
-        "pa11y",
+        resolveBinary("pa11y").command,
         [url, "--reporter", "json", "--standard", "WCAG2AA", "--runner", e, ...configArgs],
         { timeoutMs: 120_000 },
       ),

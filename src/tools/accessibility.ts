@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { runShell } from "../utils/shellRunner.js";
+import { resolveBinary } from "../utils/binaryResolver.js";
 import { parsePa11yJSON } from "../utils/outputParsers.js";
 import {
   shellErrorResponse,
@@ -154,7 +155,7 @@ async function auditUrl(
   // Engines run concurrently: unlike Lighthouse, pa11y is not measuring time,
   // so CPU contention costs nothing but wall clock.
   const results = await Promise.all(
-    engines.map((e) => runShell("pa11y", buildArgs(e), { timeoutMs: 120_000 })),
+    engines.map((e) => runShell(resolveBinary("pa11y").command, buildArgs(e), { timeoutMs: 120_000 })),
   );
 
   // pa11y exits 2 when issues are found — a successful run with data. Exit 1

@@ -14,7 +14,7 @@
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=18.0.0"
+    "node": "^22.19.0 || >=24"
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -57,7 +57,10 @@
   "homepage": "https://github.com/Hiddensound/NFunc_MCP#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "eslint": "^10.11.0",
     "execa": "^9.6.1",
+    "lighthouse": "^13.5.0",
+    "pa11y": "^10.0.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
