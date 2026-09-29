@@ -1,0 +1,7 @@
+{
+  "results": [
+    { "check_id": "javascript.lang.security.audit.eval-detected", "path": "src/api.ts", "start": { "line": 41 },
+      "extra": { "message": "Detected the use of eval().", "severity": "ERROR", "metadata": { "category": "security" } } }
+  ],
+  "errors": []
+}

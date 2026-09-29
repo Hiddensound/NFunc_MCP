@@ -2,17 +2,8 @@ import { z } from "zod";
 import { resolve } from "path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { runShell } from "../utils/shellRunner.js";
-import {
-  parseLighthouseJSON,
-  parsePa11yJSON,
-  parseSemgrepJSON,
-} from "../utils/outputParsers.js";
-import {
-  formatLighthouseFinding,
-  formatA11yFinding,
-  formatStaticAnalysisFinding,
-  type StaticAnalysisIssue,
-} from "../mappers/defectFormatter.js";
+import { parseLighthouseJSON, parsePa11yJSON } from "../utils/outputParsers.js";
+import { formatLighthouseFinding, formatA11yFinding } from "../mappers/defectFormatter.js";
 import { dedupeA11yFindings } from "../mappers/a11yDedupe.js";
 import {
   lighthouseSubScore,
@@ -21,21 +12,33 @@ import {
   compositeScore,
   type SubScores,
 } from "../mappers/compositeScore.js";
-import { formFactorArgs, type FormFactor } from "./lighthouse.js";
-import { runESLint } from "../utils/eslintRunner.js";
+import { formFactorArgs } from "./lighthouse.js";
+import { mobileConfig } from "./accessibility.js";
+import { changedFilesInput, rulesetInput } from "./staticAnalysis.js";
+import { runStaticAnalysis, type StaticRun } from "../utils/staticRunner.js";
+import { isNotInstalled, notInstalled } from "../utils/unavailable.js";
 import {
   correlate,
   type ToolReports,
   type CorrelatedFinding,
 } from "../mappers/correlator.js";
-import type { Finding } from "../types.js";
-import type { Priority } from "../mappers/priorityMapper.js";
+import {
+  a11yFindingId,
+  a11yLocation,
+  lighthouseFindingId,
+  withIds,
+} from "../mappers/findingId.js";
+import {
+  effectivePrimary,
+  mergeByFormFactor,
+  type FormFactor,
+} from "../mappers/formFactorMerge.js";
+import { buildVerdict, type ReleaseReadiness } from "../mappers/releaseVerdict.js";
+import { diffSummary, tagInDiff } from "../mappers/diffTagger.js";
+import type { Finding, Priority, UnavailableTool } from "../types.js";
 import { generateHtmlReport } from "../utils/reportGenerator.js";
 
 const PRIORITY_ORDER: Record<Priority, number> = { P1: 0, P2: 1, P3: 2 };
-
-// Option 1: four-tier readiness replaces binary pass/fail
-type ReleaseReadiness = "BLOCKED" | "CONDITIONAL" | "ADVISORY" | "CLEAR";
 
 interface ScorecardEntry {
   tool: string;
@@ -51,18 +54,18 @@ interface ScorecardEntry {
 // ---------------------------------------------------------------------------
 // Per-tool runners — each returns a structured result and never throws.
 // Errors are surfaced as the `error` field so a partial failure in one tool
-// doesn't prevent the other two from contributing findings.
+// doesn't prevent the others from contributing findings.
 // ---------------------------------------------------------------------------
 
-async function runLighthouse(
-  url: string,
-  formFactor: FormFactor,
-): Promise<{
+interface LighthouseRun {
   scores: Record<string, number>;
   ttfb_ms: number | null;
   findings: Finding[];
   error?: string;
-}> {
+  notInstalled?: boolean;
+}
+
+async function runLighthouse(url: string, formFactor: FormFactor): Promise<LighthouseRun> {
   const result = await runShell(
     "lighthouse",
     [
@@ -74,11 +77,14 @@ async function runLighthouse(
     ],
     { timeoutMs: 180_000 },
   );
-  if (result.exitCode === -1 && !result.stdout && !result.stderr) {
-    return { scores: {}, ttfb_ms: null, findings: [], error: "Lighthouse is not installed or not found in PATH." };
+  if (isNotInstalled(result)) {
+    return {
+      scores: {}, ttfb_ms: null, findings: [], notInstalled: true,
+      error: "Lighthouse is not installed or not found in PATH.",
+    };
   }
   if (!result.stdout) {
-    return { scores: {}, ttfb_ms: null, findings: [], error: `Lighthouse failed (exit ${result.exitCode}): ${result.stderr.slice(0, 300)}` };
+    return { scores: {}, ttfb_ms: null, findings: [], error: `Lighthouse (${formFactor}) failed (exit ${result.exitCode}): ${result.stderr.slice(0, 300)}` };
   }
   try {
     const parsed = parseLighthouseJSON(result.stdout);
@@ -87,36 +93,48 @@ async function runLighthouse(
       const f = formatLighthouseFinding(audit);
       if (f) findings.push(f);
     }
-    return { scores: parsed.categoryScores, ttfb_ms: parsed.ttfbMs, findings };
+    return {
+      scores: parsed.categoryScores,
+      ttfb_ms: parsed.ttfbMs,
+      findings: withIds(findings, (f) => lighthouseFindingId(f, url)),
+    };
   } catch (err) {
     return {
       scores: {}, ttfb_ms: null, findings: [],
-      error: `Lighthouse output could not be parsed: ${err instanceof Error ? err.message : String(err)}`,
+      error: `Lighthouse (${formFactor}) output could not be parsed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+}
+
+interface A11yRun {
+  violation_count: number;
+  raw_violation_count?: number;
+  findings: Finding[];
+  error?: string;
+  notInstalled?: boolean;
 }
 
 async function runA11y(
   url: string,
   engines: Array<"htmlcs" | "axe">,
-): Promise<{
-  violation_count: number;
-  raw_violation_count?: number;
-  findings: Finding[];
-  error?: string;
-}> {
+  formFactor: FormFactor,
+): Promise<A11yRun> {
+  // Same viewport run_accessibility_check uses, so the gate and the standalone
+  // tool describe the same rendered layout. Desktop passes no config, which
+  // leaves pa11y's own desktop-shaped default in place.
+  const configArgs = formFactor === "mobile" ? ["--config", await mobileConfig()] : [];
   const results = await Promise.all(
     engines.map((e) =>
       runShell(
         "pa11y",
-        [url, "--reporter", "json", "--standard", "WCAG2AA", "--runner", e],
+        [url, "--reporter", "json", "--standard", "WCAG2AA", "--runner", e, ...configArgs],
         { timeoutMs: 120_000 },
       ),
     ),
   );
 
-  if (results.every((r) => r.exitCode === -1 && !r.stdout && !r.stderr)) {
-    return { violation_count: 0, findings: [], error: "pa11y is not installed or not found in PATH." };
+  if (results.every(isNotInstalled)) {
+    return { violation_count: 0, findings: [], notInstalled: true, error: "pa11y is not installed or not found in PATH." };
   }
   // pa11y exits 2 when violations are found — that is a successful run.
   const usable = results.filter(
@@ -124,7 +142,7 @@ async function runA11y(
   );
   if (usable.length === 0) {
     const r = results[0]!;
-    return { violation_count: 0, findings: [], error: `pa11y failed (exit ${r.exitCode}): ${r.stderr.slice(0, 300)}` };
+    return { violation_count: 0, findings: [], error: `pa11y (${formFactor}) failed (exit ${r.exitCode}): ${r.stderr.slice(0, 300)}` };
   }
 
   try {
@@ -138,100 +156,133 @@ async function runA11y(
     // Dedup before the findings reach the correlator and the composite score —
     // 35 copies of one defect otherwise floor the score and swamp all_findings.
     const { findings, rawCount } = dedupeA11yFindings(rawFindings);
-    return { violation_count: findings.length, raw_violation_count: rawCount, findings };
+    return {
+      violation_count: findings.length,
+      raw_violation_count: rawCount,
+      findings: withIds(findings, (f) => a11yFindingId(f, url)),
+    };
   } catch (err) {
     return {
       violation_count: 0, findings: [],
-      error: `pa11y output could not be parsed: ${err instanceof Error ? err.message : String(err)}`,
+      error: `pa11y (${formFactor}) output could not be parsed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 }
 
-async function runStatic(absPath: string): Promise<{
-  issue_count: number;
-  eslint_config_used: string;
+// ---------------------------------------------------------------------------
+// Form-factor collapse
+// ---------------------------------------------------------------------------
+
+interface LighthouseView {
+  scores: Record<string, number>;
+  scores_by_form_factor: Partial<Record<FormFactor, Record<string, number>>>;
+  ttfb_ms: number | null;
   findings: Finding[];
-  warnings: string[];
-}> {
-  const semgrepArgs = [
-    "--config=p/javascript", "--config=p/typescript",
-    "--json", "--exclude", "node_modules", ".",
-  ];
+  primary: FormFactor | null;
+  error?: string;
+}
 
-  const [eslintRun, semgrepResult] = await Promise.all([
-    runESLint(absPath),
-    runShell("semgrep", semgrepArgs, { timeoutMs: 180_000, cwd: absPath }),
-  ]);
-
-  const allIssues: StaticAnalysisIssue[] = [...eslintRun.issues];
-  const warnings: string[] = [...eslintRun.warnings];
-
-  if (semgrepResult.exitCode === -1 && !semgrepResult.stdout && !semgrepResult.stderr) {
-    warnings.push("Semgrep not installed — Semgrep analysis skipped.");
-  } else if (semgrepResult.stdout) {
-    try {
-      for (const f of parseSemgrepJSON(semgrepResult.stdout).findings) {
-        allIssues.push({ source: "semgrep", file: f.filePath, line: f.line, ruleId: f.ruleId, message: f.message, severity: f.severity, category: f.category });
-      }
-    } catch { warnings.push("Semgrep output could not be parsed."); }
+/**
+ * Headline scores are the primary profile's, not the worst of the two. The
+ * worst-of rule mixed profiles category by category — desktop's performance
+ * beside mobile's accessibility — into a set of numbers no single run ever
+ * produced.
+ */
+export function collapseLighthouse(
+  runs: Array<{ ff: FormFactor; data: LighthouseRun }>,
+  requestedPrimary: FormFactor,
+): LighthouseView {
+  const ok = runs.filter((r) => !r.data.error);
+  if (ok.length === 0) {
+    return {
+      scores: {}, scores_by_form_factor: {}, ttfb_ms: null, findings: [], primary: null,
+      error: runs[0]?.data.error ?? "Lighthouse did not run.",
+    };
   }
+  const primary = effectivePrimary(requestedPrimary, ok.map((r) => r.ff))!;
+  const primaryRun = ok.find((r) => r.ff === primary)!.data;
+  const scoresBy: LighthouseView["scores_by_form_factor"] = {};
+  for (const { ff, data } of ok) scoresBy[ff] = data.scores;
 
-  // Deduplicate by file:line.
-  const dedupMap = new Map<string, Finding>();
-  for (const issue of allIssues) {
-    const f = formatStaticAnalysisFinding(issue);
-    if (!f) continue;
-    const key = `${String(f.evidence["file"])}:${String(f.evidence["line"])}`;
-    const existing = dedupMap.get(key);
-    if (!existing || PRIORITY_ORDER[f.priority] < PRIORITY_ORDER[existing.priority]) {
-      dedupMap.set(key, f);
-    }
+  return {
+    scores: primaryRun.scores,
+    scores_by_form_factor: scoresBy,
+    ttfb_ms: primaryRun.ttfb_ms,
+    findings: mergeByFormFactor(
+      ok.map(({ ff, data }) => ({ ff, findings: data.findings })),
+      (f) => String(f.evidence["audit_id"]),
+      requestedPrimary,
+      { legacyEvidence: true },
+    ),
+    primary,
+  };
+}
+
+interface A11yView {
+  violation_count: number;
+  raw_violation_count?: number;
+  findings: Finding[];
+  /** The primary profile's own findings, for the pa11y sub-score. */
+  primary_findings: Finding[];
+  primary: FormFactor | null;
+  error?: string;
+}
+
+export function collapseA11y(
+  runs: Array<{ ff: FormFactor; data: A11yRun }>,
+  requestedPrimary: FormFactor,
+): A11yView {
+  const ok = runs.filter((r) => !r.data.error);
+  if (ok.length === 0) {
+    return {
+      violation_count: 0, findings: [], primary_findings: [], primary: null,
+      error: runs[0]?.data.error ?? "pa11y did not run.",
+    };
   }
-  const findings = Array.from(dedupMap.values());
-
-  return { issue_count: findings.length, eslint_config_used: eslintRun.config_used, findings, warnings };
+  const primary = effectivePrimary(requestedPrimary, ok.map((r) => r.ff))!;
+  const findings = mergeByFormFactor(
+    ok.map(({ ff, data }) => ({ ff, findings: data.findings })),
+    (f) => `${String(f.evidence["rule_code"] ?? "")}|${a11yLocation(f)}`,
+    requestedPrimary,
+  );
+  const raw = ok.reduce((n, r) => n + (r.data.raw_violation_count ?? r.data.violation_count), 0);
+  return {
+    violation_count: findings.length,
+    raw_violation_count: raw,
+    findings,
+    primary_findings: ok.find((r) => r.ff === primary)!.data.findings,
+    primary,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Report assembly helpers
 // ---------------------------------------------------------------------------
 
-// Option 1: four-tier readiness verdict
-function buildVerdict(findings: CorrelatedFinding[]): ReleaseReadiness {
-  if (findings.some((f) => f.priority === "P1")) return "BLOCKED";
-  if (findings.some((f) => f.priority === "P2")) return "CONDITIONAL";
-  if (findings.some((f) => f.priority === "P3")) return "ADVISORY";
-  return "CLEAR";
-}
-
 // Composite score. See src/mappers/compositeScore.ts for why this is a
 // weighted mean of per-tool sub-scores rather than one global subtraction.
 function buildSubScores(
-  lhData: { scores: Record<string, number>; error?: string } | null,
-  a11yData: { findings: Finding[]; error?: string } | null,
-  staticData: { findings: Finding[] } | null,
+  lhData: LighthouseView | null,
+  a11yData: A11yView | null,
+  staticData: { findings: Finding[]; tools_run: string[] } | null,
 ): SubScores {
   return {
     lighthouse:
       lhData && !lhData.error ? lighthouseSubScore(lhData.scores) : null,
-    pa11y: a11yData && !a11yData.error ? a11ySubScore(a11yData.findings) : null,
-    static: staticData ? staticSubScore(staticData.findings) : null,
+    pa11y: a11yData && !a11yData.error ? a11ySubScore(a11yData.primary_findings) : null,
+    // Nothing ran is not the same as nothing found: no score rather than 100.
+    static: staticData && staticData.tools_run.length > 0 ? staticSubScore(staticData.findings) : null,
   };
 }
 
-// Option 3: compact per-tool scorecard
+// Compact per-tool scorecard.
 // Any argument may be null when the caller did not supply the corresponding
 // input (url or path) — those tools show SKIPPED rather than UNAVAILABLE.
 // UNAVAILABLE is reserved for tools that were attempted but failed or are not installed.
 function buildScorecard(
-  lhData: { scores: Record<string, number>; error?: string } | null,
-  a11yData: {
-    violation_count: number;
-    raw_violation_count?: number;
-    findings: Finding[];
-    error?: string;
-  } | null,
-  staticData: { issue_count: number; findings: Finding[] } | null,
+  lhData: LighthouseView | null,
+  a11yData: A11yView | null,
+  staticData: { findings: Finding[]; tools_run: string[] } | null,
 ): ScorecardEntry[] {
   const entries: ScorecardEntry[] = [];
 
@@ -272,13 +323,15 @@ function buildScorecard(
 
   if (staticData === null) {
     entries.push({ tool: "ESLint / Semgrep", gate: "SKIPPED" });
+  } else if (staticData.tools_run.length === 0) {
+    entries.push({ tool: "ESLint / Semgrep", gate: "UNAVAILABLE" });
   } else {
     const staticP1 = staticData.findings.some((f) => f.priority === "P1");
     const staticP2 = staticData.findings.some((f) => f.priority === "P2");
     entries.push({
       tool: "ESLint / Semgrep",
       gate: staticP1 ? "FAIL" : staticP2 ? "WARN" : "PASS",
-      issues: staticData.issue_count,
+      issues: staticData.findings.length,
     });
   }
 
@@ -319,6 +372,16 @@ function buildSummary(
   return `${n} finding${n !== 1 ? "s" : ""} (${breakdown}) across ${m} tool${m !== 1 ? "s" : ""}.${corrLine} ${readinessLine[readiness]}`;
 }
 
+function uniqueUnavailable(list: UnavailableTool[]): UnavailableTool[] {
+  const seen = new Set<string>();
+  return list.filter((u) => {
+    const key = `${u.tool}|${u.reason}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Tool registration
 // ---------------------------------------------------------------------------
@@ -348,17 +411,26 @@ const inputShape = {
     .optional()
     .describe(
       "Optional free-text context about the project (e.g. 'React SPA', 'checkout flow', " +
-      "'marketing site'). Pass anything the user mentions about what the app is or does.",
+      "'marketing site'). Echoed into the report and the HTML header so a saved report " +
+      "says what was being checked; it does not change any check or priority.",
     ),
   form_factor: z
     .enum(["mobile", "desktop", "both"])
     .optional()
     .describe(
-      "Lighthouse device profile: 'desktop' (default, unthrottled), 'mobile' " +
-      "(throttled slow 4G with a 4x CPU slowdown, which scores far lower for " +
-      "the same page), or 'both'. The profiles render different DOM and find " +
+      "Device profile for Lighthouse and pa11y: 'desktop' (default, unthrottled), 'mobile' " +
+      "(throttled slow 4G with a 4x CPU slowdown for Lighthouse, a 412x823 touch viewport " +
+      "for pa11y), or 'both'. The profiles render different DOM and find " +
       "different accessibility and SEO defects, so 'both' is the thorough " +
       "choice; it runs concurrently and costs little extra wall time.",
+    ),
+  primary_form_factor: z
+    .enum(["desktop", "mobile"])
+    .optional()
+    .describe(
+      "Which profile speaks for the page when form_factor is 'both' (default 'desktop'). " +
+      "Headline scores and sub_scores come from it, and a finding only the other profile " +
+      "reports is demoted one tier (P1→P2, P2→P3). Per-profile priorities stay on each finding.",
     ),
   a11y_runner: z
     .enum(["htmlcs", "axe", "both"])
@@ -368,6 +440,15 @@ const inputShape = {
       "labels and forms; 'axe' for materially better ARIA and computed " +
       "contrast coverage; 'both' to merge them. Choose 'axe' or 'both' when " +
       "the code under test involves ARIA or a component library.",
+    ),
+  changed_files: changedFilesInput,
+  ruleset: rulesetInput,
+  output_dir: z
+    .string()
+    .optional()
+    .describe(
+      "Directory to write the HTML report and a JSON copy of this result into (created if " +
+      "missing). Default: HTML only, in the OS temp directory. Paths are returned in report_paths.",
     ),
 };
 
@@ -394,12 +475,16 @@ export function registerQaGateTool(server: McpServer): void {
         "\n\n" +
         "Returns: release_readiness (BLOCKED / CONDITIONAL / ADVISORY / CLEAR), a composite_score " +
         "(0–100 severity-weighted health score), a per-tool scorecard with gate status, a plain-English " +
-        "summary, top 3 issues, and a full prioritised finding list. " +
-        "If any individual tool is not installed, the report is still produced from the others — " +
-        "it never fails completely.",
+        "summary, top 3 issues, and a full prioritised finding list. Every finding has a stable `id`. " +
+        "Pass changed_files to tag static findings in_diff. " +
+        "If any individual tool is not installed, the report is still produced from the others and " +
+        "the missing tool is listed in `unavailable` with its install command — it never fails completely.",
       inputSchema: inputShape,
     },
-    async ({ url, path: targetPath, form_factor, a11y_runner }) => {
+    async ({
+      url, path: targetPath, context, form_factor, primary_form_factor, a11y_runner,
+      changed_files, ruleset, output_dir,
+    }) => {
       if (!url && !targetPath) {
         return {
           content: [{ type: "text" as const, text: JSON.stringify({
@@ -412,69 +497,63 @@ export function registerQaGateTool(server: McpServer): void {
 
       const requestedFF = form_factor ?? "desktop";
       const factors: FormFactor[] =
-        requestedFF === "both" ? ["mobile", "desktop"] : [requestedFF];
+        requestedFF === "both" ? ["desktop", "mobile"] : [requestedFF];
+      const requestedPrimary: FormFactor = primary_form_factor ?? "desktop";
       const requestedRunner = a11y_runner ?? "htmlcs";
       const engines: Array<"htmlcs" | "axe"> =
         requestedRunner === "both" ? ["htmlcs", "axe"] : [requestedRunner];
+      const absPath = targetPath ? resolve(targetPath) : undefined;
 
       // Only run the tools we have inputs for. null means deliberately skipped,
       // not a failure — the scorecard will show SKIPPED for those entries.
-      // Every leg — including each Lighthouse form factor — runs concurrently.
-      const [lhRuns, a11yData, staticData] = await Promise.all([
+      // Every leg — including each form factor — runs concurrently.
+      const [lhRuns, a11yRuns, staticRun] = await Promise.all([
         url
-          ? Promise.all(
-              factors.map(async (ff) => ({ ff, data: await runLighthouse(url, ff) })),
-            )
+          ? Promise.all(factors.map(async (ff) => ({ ff, data: await runLighthouse(url, ff) })))
           : null,
-        url ? runA11y(url, engines) : null,
-        targetPath ? runStatic(resolve(targetPath)) : null,
+        url
+          ? Promise.all(factors.map(async (ff) => ({ ff, data: await runA11y(url, engines, ff) })))
+          : null,
+        absPath ? runStaticAnalysis(absPath, { ruleset }) : null,
       ]);
 
-      // Collapse the form factors into one Lighthouse view for the rest of the
-      // report. Findings are merged on audit_id and tagged with the form
-      // factors they affect; scores keep the worst per category, since a page
-      // is only as healthy as its weaker profile.
-      const lhOk = lhRuns?.filter((r) => !r.data.error) ?? [];
-      const lhData: {
-        scores: Record<string, number>;
-        ttfb_ms: number | null;
-        findings: Finding[];
-        error?: string;
-      } | null = !lhRuns
-        ? null
-        : lhOk.length === 0
-          ? lhRuns[0]!.data
-          : (() => {
-              const scores: Record<string, number> = {};
-              for (const { data } of lhOk) {
-                for (const [k, v] of Object.entries(data.scores)) {
-                  scores[k] = k in scores ? Math.min(scores[k]!, v) : v;
-                }
-              }
-              const merged = new Map<string, Finding & { _ff: FormFactor[] }>();
-              for (const { ff, data } of lhOk) {
-                for (const f of data.findings) {
-                  const key = String(f.evidence["audit_id"]);
-                  const hit = merged.get(key);
-                  if (hit) hit._ff.push(ff);
-                  else merged.set(key, { ...f, _ff: [ff] });
-                }
-              }
-              const findings = Array.from(merged.values()).map(({ _ff, ...f }) => ({
-                ...f,
-                evidence:
-                  factors.length > 1
-                    ? { ...f.evidence, affects_form_factors: _ff, form_factor_specific: _ff.length === 1 }
-                    : f.evidence,
-              }));
-              return { scores, ttfb_ms: lhOk[0]!.data.ttfb_ms, findings };
-            })();
+      const lhData = lhRuns ? collapseLighthouse(lhRuns, requestedPrimary) : null;
+      const a11yData = a11yRuns ? collapseA11y(a11yRuns, requestedPrimary) : null;
+      const staticData: (StaticRun & { findings: Finding[] }) | null =
+        staticRun && absPath
+          ? { ...staticRun, findings: tagInDiff(staticRun.findings, changed_files, absPath) }
+          : null;
 
       // Surface tool errors but don't abort — partial reports are still useful.
+      // A profile that failed while the other succeeded is reported too; the
+      // collapsed view alone would hide it.
       const errors: string[] = [];
-      if (lhData?.error) errors.push(lhData.error);
-      if (a11yData?.error) errors.push(a11yData.error);
+      for (const runs of [lhRuns, a11yRuns]) {
+        if (!runs) continue;
+        const failed = runs.filter((r) => r.data.error);
+        const seen = new Set<string>();
+        for (const r of failed) {
+          if (seen.has(r.data.error!)) continue;
+          seen.add(r.data.error!);
+          errors.push(r.data.error!);
+        }
+      }
       if (staticData?.warnings) errors.push(...staticData.warnings);
+      if (factors.length > 1) {
+        for (const [name, view] of [["Lighthouse", lhData], ["pa11y", a11yData]] as const) {
+          if (view && !view.error && view.primary !== requestedPrimary) {
+            errors.push(
+              `${name} has no ${requestedPrimary} result, so ${view.primary} was used as its primary profile and nothing was demoted.`,
+            );
+          }
+        }
+      }
+
+      const unavailable = uniqueUnavailable([
+        ...(lhRuns?.some((r) => r.data.notInstalled) ? [notInstalled("lighthouse")] : []),
+        ...(a11yRuns?.some((r) => r.data.notInstalled) ? [notInstalled("pa11y")] : []),
+        ...(staticData?.unavailable ?? []),
+      ]);
 
       const reports: ToolReports = {
         lighthouse: lhData && !lhData.error
@@ -484,12 +563,12 @@ export function registerQaGateTool(server: McpServer): void {
           ? { violation_count: a11yData.violation_count, findings: a11yData.findings }
           : null,
         static: staticData
-          ? { issue_count: staticData.issue_count, findings: staticData.findings }
+          ? { issue_count: staticData.findings.length, findings: staticData.findings }
           : null,
       };
 
       const { correlated_findings, unique_findings, correlations_count } =
-        correlate(reports);
+        correlate(reports, { url });
 
       // Corroborated findings get a first-class section with an explicit
       // confidence marker. Within the same priority, they sort before
@@ -511,9 +590,11 @@ export function registerQaGateTool(server: McpServer): void {
       const toolsRan = [
         ...(lhData && !lhData.error ? ["lighthouse"] : []),
         ...(a11yData && !a11yData.error ? ["pa11y"] : []),
-        ...(staticData ? ["eslint", "semgrep"] : []),
+        ...(staticData?.tools_run ?? []),
       ];
 
+      // Readiness runs over the adjusted priorities: promoted by correlation,
+      // demoted when only the non-primary profile reports a finding.
       const readiness = buildVerdict(allFindings);
       const subScores = buildSubScores(lhData, a11yData, staticData);
       const composite = compositeScore(subScores);
@@ -523,37 +604,64 @@ export function registerQaGateTool(server: McpServer): void {
       const report: Record<string, unknown> = {
         release_readiness: readiness,
         composite_score: composite,
+        ...(context ? { context } : {}),
+        ...(url
+          ? {
+              form_factor: requestedFF,
+              primary_form_factor: requestedPrimary,
+            }
+          : {}),
+        ...(lhData && !lhData.error
+          ? { scores: lhData.scores, scores_by_form_factor: lhData.scores_by_form_factor }
+          : {}),
         // Per-tool 0–100 health, so a low composite is attributable rather than
         // just low. Null means the tool did not run or did not produce a score.
         sub_scores: subScores,
         scorecard,
         ...(staticData ? { eslint_config_used: staticData.eslint_config_used } : {}),
         summary,
+        ...(changed_files ? { diff_summary: diffSummary(allFindings) } : {}),
         corroborated_findings: corroboratedFindings,
         top_issues: allFindings.slice(0, 3),
         all_findings: allFindings,
         correlations_found: correlations_count,
       };
+      if (unavailable.length > 0) report["unavailable"] = unavailable;
       if (errors.length > 0) report["errors"] = errors;
 
       // Generate a self-contained HTML report the user can open in a browser.
       try {
-        const reportPath = await generateHtmlReport({
-          url,
-          path: targetPath,
-          release_readiness: readiness,
-          composite_score: composite ?? 0,
-          scorecard,
-          summary,
-          corroborated_findings: corroboratedFindings as unknown as Array<Record<string, unknown>>,
-          all_findings: allFindings as unknown as Array<Record<string, unknown>>,
-          correlations_found: correlations_count,
-          errors: errors.length > 0 ? errors : undefined,
-          generated_at: new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC",
-        });
-        report["report_file"] = `file://${reportPath}`;
-      } catch {
-        // Non-fatal — JSON report is still returned if HTML generation fails.
+        const paths = await generateHtmlReport(
+          {
+            url,
+            path: targetPath,
+            context,
+            release_readiness: readiness,
+            composite_score: composite ?? 0,
+            scorecard,
+            summary,
+            corroborated_findings: corroboratedFindings as unknown as Array<Record<string, unknown>>,
+            all_findings: allFindings as unknown as Array<Record<string, unknown>>,
+            correlations_found: correlations_count,
+            errors: errors.length > 0 ? errors : undefined,
+            generated_at: new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC",
+          },
+          {
+            outputDir: output_dir,
+            json: (p) => ({ ...report, report_file: `file://${p.html}`, report_paths: p }),
+          },
+        );
+        report["report_file"] = `file://${paths.html}`;
+        report["report_paths"] = paths;
+      } catch (err) {
+        // Non-fatal — the JSON report is still returned. Said out loud when the
+        // caller asked for a specific directory, since they will look there.
+        if (output_dir) {
+          report["errors"] = [
+            ...errors,
+            `Could not write the report to ${resolve(output_dir)}: ${err instanceof Error ? err.message : String(err)}`,
+          ];
+        }
       }
 
       return {

@@ -28,6 +28,7 @@ import {
 import { formatLighthouseFinding } from "../mappers/defectFormatter.js";
 import { sortFindingsByPriority } from "../mappers/priorityMapper.js";
 import type { Finding } from "../types.js";
+import { lighthouseFindingId, withIds } from "../mappers/findingId.js";
 
 export type FormFactor = "mobile" | "desktop";
 
@@ -136,6 +137,7 @@ async function runLighthouseOnce(
 function buildFindings(
   parsed: ParsedLighthouse,
   thresholds: Record<string, number> | undefined,
+  url: string,
 ): Finding[] {
   const out: Finding[] = [];
   for (const audit of parsed.failedAudits) {
@@ -144,7 +146,7 @@ function buildFindings(
     const finding = formatLighthouseFinding(audit);
     if (finding) out.push(finding);
   }
-  return out;
+  return withIds(out, (f) => lighthouseFindingId(f, url));
 }
 
 /**
@@ -154,10 +156,11 @@ function buildFindings(
 function mergeAcrossFactors(
   runs: AuditRun[],
   thresholds: Record<string, number> | undefined,
+  url: string,
 ): Finding[] {
   const merged = new Map<string, Finding & { _ff: FormFactor[] }>();
   for (const { factor, parsed } of runs) {
-    for (const finding of buildFindings(parsed, thresholds)) {
+    for (const finding of buildFindings(parsed, thresholds, url)) {
       const key = String(finding.evidence["audit_id"]);
       const existing = merged.get(key);
       if (existing) existing._ff.push(factor);
@@ -303,7 +306,7 @@ export function registerLighthouseTool(server: McpServer) {
         // Per-factor records, so a single-URL run can seed or be compared to a
         // baseline exactly like a batch one.
         const singleRecords: LighthouseRecord[] = good.map(({ factor, parsed, raw }) => {
-          const findings = sortFindingsByPriority(buildFindings(parsed, thresholds));
+          const findings = sortFindingsByPriority(buildFindings(parsed, thresholds, target));
           return {
             url: target,
             variant: factor,
@@ -341,7 +344,7 @@ export function registerLighthouseTool(server: McpServer) {
             form_factor: factors[0],
             scores: parsed.categoryScores,
             ttfb_ms: parsed.ttfbMs,
-            findings: sortFindingsByPriority(buildFindings(parsed, thresholds)),
+            findings: sortFindingsByPriority(buildFindings(parsed, thresholds, target)),
             ...persisted,
             ...(comparison ? { comparison } : {}),
             ...(warnings.length ? { warnings } : {}),
@@ -360,7 +363,7 @@ export function registerLighthouseTool(server: McpServer) {
           form_factors_run: good.map((g) => g.factor),
           scores,
           ttfb_ms: ttfb,
-          findings: mergeAcrossFactors(good, thresholds),
+          findings: mergeAcrossFactors(good, thresholds, target),
           ...persisted,
           ...(comparison ? { comparison } : {}),
           ...(warnings.length ? { warnings } : {}),
@@ -439,7 +442,7 @@ export function registerLighthouseTool(server: McpServer) {
         // parsing. The summary lives in the index.
         await writeFile(join(dir, reportFile), raw, "utf8");
 
-        const findings = sortFindingsByPriority(buildFindings(parsed, thresholds));
+        const findings = sortFindingsByPriority(buildFindings(parsed, thresholds, unit.url));
         records.push({
           url: unit.url,
           variant: factor,

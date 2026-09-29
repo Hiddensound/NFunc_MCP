@@ -1,0 +1,9 @@
+[
+  { "filePath": "/repo/src/app.js", "messages": [
+    { "ruleId": "no-undef", "severity": 2, "message": "'fetchUser' is not defined.", "line": 12, "column": 5 },
+    { "ruleId": "no-console", "severity": 1, "message": "Unexpected console statement.", "line": 30, "column": 3 }
+  ] },
+  { "filePath": "/repo/src/legacy/util.js", "messages": [
+    { "ruleId": "eqeqeq", "severity": 2, "message": "Expected '===' and instead saw '=='.", "line": 4, "column": 9 }
+  ] }
+]

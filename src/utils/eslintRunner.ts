@@ -19,6 +19,8 @@ export interface ESLintRunResult {
   packages: string[];  // relative paths of per-package runs; empty otherwise
   warnings: string[];
   ran: boolean;
+  /** The ESLint binary could not be spawned. */
+  notInstalled: boolean;
 }
 
 interface RunSpec {
@@ -135,5 +137,5 @@ export async function runESLint(absPath: string): Promise<ESLintRunResult> {
     warnings.push("ESLint is not installed or not found in PATH — ESLint analysis skipped.");
   }
 
-  return { issues, config_used, packages, warnings, ran: ran && !notInstalled };
+  return { issues, config_used, packages, warnings, ran: ran && !notInstalled, notInstalled };
 }

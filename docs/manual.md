@@ -127,6 +127,8 @@ claude mcp add nfunc-mcp -- node /absolute/path/to/NFunc_MCP/dist/index.js
 | `npm run build` | Compile TypeScript → `dist/` |
 | `npm start` | Run the compiled server |
 | `npm run dev` | Run from source with hot reload (`tsx watch`) |
+| `npm test` | Unit tests (`node:test` via `tsx`) over the JSON fixtures in `test/fixtures` — no CLIs needed |
+| `npm run typecheck` | Type-check `src/` and `test/` together |
 
 For local development, registering `tsx src/index.ts` instead of
 `dist/index.js` means edits need only an MCP reconnect, not a rebuild.
@@ -152,9 +154,129 @@ Both `url` and `path` are optional; at least one is required.
 |---|---|---|
 | `url` | string (URL) | A running page — production, staging, preview, or localhost. Enables Lighthouse and pa11y. |
 | `path` | string (path) | A local codebase. Enables ESLint and Semgrep. |
-| `context` | string | Optional free-text description (e.g. `"React e-commerce checkout"`). Helps interpretation. |
-| `form_factor` | `mobile` \| `desktop` \| `both` | Optional, default `mobile`. See [mobile vs desktop](#mobile-vs-desktop). |
+| `context` | string | Optional free-text description (e.g. `"React e-commerce checkout"`). Echoed into the report (`context`) and the HTML header; it does not change any check or priority. |
+| `form_factor` | `mobile` \| `desktop` \| `both` | Optional, default `desktop`. Applies to Lighthouse **and** pa11y. See [form factors in the gate](#form-factors-in-the-gate). |
+| `primary_form_factor` | `desktop` \| `mobile` | Optional, default `desktop`. Which profile speaks for the page when both run. |
 | `a11y_runner` | `htmlcs` \| `axe` \| `both` | Optional, default `htmlcs`. See [choosing an engine](#choosing-an-accessibility-engine). |
+| `changed_files` | string[] | Optional. Paths relative to `path` — e.g. `git diff --name-only main...HEAD`. Tags each static finding `in_diff`. See [diff tagging](#diff-tagging-changed_files). |
+| `ruleset` | string \| string[] | Optional. Semgrep rulesets, passed through as `--config`. Registry ids (`p/python`) or local rule files/directories; a string may be comma-separated. Default `p/javascript` + `p/typescript`. |
+| `output_dir` | string | Optional. Write the HTML report **and a JSON copy of the result** here (created if missing) instead of the OS temp directory. Paths come back in `report_paths`. |
+
+`url` accepts `localhost` and any other `http(s)` address.
+
+### Form factors in the gate
+
+With `form_factor: "both"`, Lighthouse and pa11y each run once per profile,
+concurrently. pa11y's mobile run uses the same 412×823 touch viewport as
+`run_accessibility_check`; its desktop run uses pa11y's own default viewport.
+`form_factor: "mobile"` alone runs pa11y at the mobile viewport too.
+
+One profile is **primary** (`primary_form_factor`, default `desktop`):
+
+- A finding both profiles report takes the **primary's** priority and evidence.
+- A finding **only the other profile** reports is kept, **demoted one tier**
+  (P1→P2, P2→P3), and marked `form_factor_specific: true`.
+- A finding only the primary reports keeps its priority (and is also
+  `form_factor_specific: true` — the flag means "one profile only").
+- Headline `scores`, `sub_scores` and the scorecard's Lighthouse breakdown come
+  from the primary profile. `scores_by_form_factor` has both.
+- `release_readiness` is computed after the demotion, so a mobile-only P1 under
+  a desktop primary makes the run `CONDITIONAL`, not `BLOCKED`.
+
+Every merged Lighthouse and pa11y finding carries the raw per-profile
+priorities, so the demotion is visible rather than silent:
+
+```jsonc
+{
+  "priority": "P2",                                   // adjusted
+  "priority_by_form_factor": { "mobile": "P1" },      // raw, per profile
+  "affects_form_factors": ["mobile"],
+  "form_factor_specific": true                        // only when both ran
+}
+```
+
+Lighthouse findings are merged on `audit_id`; pa11y findings on
+`(rule_code, selector)`, where a systemic finding (one rule collapsed across
+many elements) uses `*` as its selector so the desktop and mobile versions of
+it merge. When only one profile ran — or the primary one failed — that profile
+is used as primary and nothing is demoted; the latter case adds a line to
+`errors`. The Lighthouse copies of `affects_form_factors` and
+`form_factor_specific` inside `evidence`, from earlier versions, are still
+written when both profiles run.
+
+### Diff tagging (`changed_files`)
+
+`run_qa_gate`, `run_static_analysis` and `run_security_scan` accept
+`changed_files`. Nothing is filtered out; every file-based finding gains
+`in_diff: true | false`:
+
+| Finding | `in_diff` is true when |
+|---|---|
+| ESLint, Semgrep | its file is in `changed_files` |
+| Trivy secret, Trivy misconfiguration | its file is in `changed_files` |
+| Trivy vulnerability | the lockfile Trivy attributes it to is in `changed_files`, **or that lockfile's manifest** (`package-lock.json`/`yarn.lock`/`pnpm-lock.yaml` → `package.json` in the same directory, `poetry.lock` → `pyproject.toml`, `go.sum` → `go.mod`, `Cargo.lock` → `Cargo.toml`, and so on) |
+| Lighthouse, pa11y | never tagged — a rendered page has no file |
+
+The report adds a `diff_summary` with per-tier counts over the tagged findings:
+
+```jsonc
+"diff_summary": {
+  "in_diff":     { "P1": 1, "P2": 1, "P3": 0 },
+  "preexisting": { "P1": 1, "P2": 3, "P3": 7 }
+}
+```
+
+Paths may be given as `src/a.js`, `./src/a.js` or an absolute path under
+`path`. ESLint reports absolute paths and Semgrep relative ones; both are
+compared in the relative form.
+
+### Finding ids
+
+Every finding from every tool except the PSI pair carries a deterministic
+`id`: the tool name plus the first 12 hex characters of a SHA-256 over
+
+| Finding | Hashed |
+|---|---|
+| Lighthouse | tool, `audit_id`, URL |
+| pa11y | tool, `rule_code`, selector (`*` for systemic findings), URL |
+| ESLint / Semgrep | tool, rule id, `file:line` relative to `path` |
+| Trivy secret / misconfig | `trivy`, rule or check id, `file:line` relative to `path` (plus the resource name for a misconfig, when Trivy gives one) |
+| Trivy vulnerability | `trivy`, `package@installed-version`, lockfile relative to `path` |
+| Corroborated (Lighthouse + pa11y) | `lighthouse+pa11y`, `audit_id`, URL |
+
+e.g. `lighthouse-882d195f3f6d`, `eslint-19ab9df7628d`. Form factor is never
+an input, so the desktop and mobile copies of a finding share one id. Running
+the same check on unchanged code gives the same ids, which is what lets a
+caller confirm that one specific finding is gone after a fix.
+
+Two consequences worth knowing. An edit **above** a static finding shifts its
+line and so changes its id. And a vulnerability's id changes when the
+installed version does — which is the point: the upgrade that fixes it
+removes that id.
+
+### Missing tools (`unavailable`)
+
+A tool that could not run is listed rather than failing the call:
+
+```jsonc
+"unavailable": [
+  { "tool": "semgrep", "binary": "semgrep", "reason": "network",
+    "install_hint": "Semgrep downloads registry rulesets (p/javascript, p/typescript) from semgrep.dev ..." },
+  { "tool": "eslint", "binary": "eslint", "reason": "not_installed",
+    "install_hint": "npm install --save-dev eslint (in the project) or npm install -g eslint" }
+]
+```
+
+`reason` is `not_installed` (the binary is not on `PATH`) or `network` (Semgrep
+registry rulesets are downloaded at scan time and semgrep.dev was
+unreachable — pass a local `ruleset` to scan offline). Present on
+`run_qa_gate`, `run_static_analysis` and `run_security_scan`, only when
+non-empty. The human-readable lines stay in `errors` / `warnings` as before.
+
+**`release_readiness: "CLEAR"` with a non-empty `unavailable` means less was
+checked than asked for, not that it passed.** When neither ESLint nor Semgrep
+ran, the static scorecard entry is `UNAVAILABLE` and `sub_scores.static` is
+`null` rather than a clean 100.
 
 ### Release readiness tiers
 
@@ -167,9 +289,26 @@ Both `url` and `path` are optional; at least one is required.
 
 ### Composite score
 
-A single 0–100 health measure. Start at 100 and deduct: **P1 −15, P2 −7,
-P3 −3**, floored at 0. Most useful as a trend line across sprints rather than
-as an absolute grade.
+A single 0–100 health measure: the **weighted mean of per-tool sub-scores**,
+over only the tools that produced one. Each sub-score is returned in
+`sub_scores` so a low composite is attributable.
+
+| Sub-score | How it is computed | Weight |
+|---|---|---|
+| `lighthouse` | Lighthouse's own category scores (primary profile), weighted performance 0.3, accessibility 0.3, best-practices 0.2, SEO 0.2; any other category 0.05 | 0.4 |
+| `pa11y` | `100 × e^(−damage / 90)` over the primary profile's findings | 0.4 |
+| `static` | `100 × e^(−damage / 60)` over ESLint + Semgrep findings | 0.2 |
+
+`damage` is the sum of **P1 = 10, P2 = 3, P3 = 1** over the findings. The decay
+never reaches zero and each extra finding costs less than the last — at K = 90
+one P1 scores 89, five score 57, fifteen score 19 — so a bad page and a
+catastrophic one stay distinguishable. Weights are renormalised over the tools
+that ran, so a url-only run and a url+path run are on the same scale.
+`composite_score` is `null` when nothing produced a score.
+
+This replaced an earlier "100 − 15 per P1, 7 per P2, 3 per P3" formula, which
+floored at seven P1s and fell whenever more tools ran. Most useful as a trend
+line across sprints rather than as an absolute grade.
 
 ### Scorecard
 
@@ -190,7 +329,9 @@ One line per tool:
 | `WARN` | Issues below the FAIL threshold |
 | `FAIL` | P1-level issues (or Lighthouse average < 50) |
 | `SKIPPED` | Input not provided |
-| `UNAVAILABLE` | Tool invoked but not installed, or errored |
+| `UNAVAILABLE` | Tool invoked but not installed, or errored — see `unavailable` |
+
+The Lighthouse `breakdown` is the primary profile's category scores.
 
 ### Cross-tool corroboration
 
@@ -221,38 +362,66 @@ by reference, not merged.
 
 ### HTML report
 
-Every call writes a self-contained HTML file to `/tmp` and returns its path as
-`report_file`. It contains the readiness banner, a composite-score gauge,
-the scorecard, cross-confirmed findings, and collapsible finding cards grouped
-by priority. Inline CSS, no server needed.
+Every call writes a self-contained HTML file to the OS temp directory and
+returns its path as `report_file` (a `file://` URL) and `report_paths.html`. It
+contains the readiness banner, a composite-score gauge, the scorecard,
+cross-confirmed findings, and collapsible finding cards grouped by priority.
+Inline CSS, no server needed.
+
+With `output_dir`, the HTML goes there instead, alongside a JSON copy of the
+full tool result (`report_paths.json`), both named
+`qa-report-<host>-<timestamp>`. The directory is created if missing; a write
+failure is reported in `errors` rather than failing the call.
 
 ### Output shape
 
 ```jsonc
 {
   "release_readiness": "BLOCKED",        // BLOCKED | CONDITIONAL | ADVISORY | CLEAR
-  "composite_score": 22,                 // 0–100
-  "report_file": "file:///tmp/qa-report-xxx.html",
+  "composite_score": 22,                 // 0–100, null when nothing scored
+  "context": "React checkout",           // only when context was supplied
+  "form_factor": "both",                 // only when url was supplied
+  "primary_form_factor": "desktop",      // only when url was supplied
+  "scores": { "performance": 85, ... },  // primary profile's Lighthouse categories
+  "scores_by_form_factor": {             // every profile that ran
+    "desktop": { "performance": 85, ... },
+    "mobile":  { "performance": 40, ... }
+  },
+  "sub_scores": { "lighthouse": 80, "pa11y": 57, "static": 92 },
   "scorecard": [ ... ],
   "eslint_config_used": "project",       // only when path was supplied
   "summary": "110 findings (101 P1, 9 P2) across 2 tools. ...",
+  "diff_summary": { ... },               // only when changed_files was supplied
   "corroborated_findings": [ ... ],      // cross-confirmed, confidence: "high"
   "top_issues": [ ... ],                 // top 3 (corroborated first)
   "all_findings": [ ... ],               // all, sorted by priority
   "correlations_found": 1,
-  "errors": [ ... ]                      // only if a tool errored
+  "unavailable": [ ... ],                // only if a tool could not run
+  "errors": [ ... ],                     // only if a tool errored
+  "report_file": "file:///tmp/qa-report-xxx.html",
+  "report_paths": { "html": "/tmp/qa-report-xxx.html", "json": "..." }  // json only with output_dir
 }
 ```
+
+`scores` and `scores_by_form_factor` are present only when Lighthouse ran.
+`summary` stays a sentence; the diff counts are in `diff_summary`.
 
 Each finding:
 
 ```jsonc
 {
-  "priority": "P1",
+  "id": "lighthouse-882d195f3f6d",       // stable — see Finding ids
+  "priority": "P1",                      // adjusted (correlation, form factor)
   "title": "Largest Contentful Paint",
   "description": "Users see main content 34s after navigation...",
   "evidence": { "audit_id": "largest-contentful-paint", "value": "34.3 s" },
   "source_tool": "lighthouse",
+  // Lighthouse and pa11y findings:
+  "priority_by_form_factor": { "desktop": "P1", "mobile": "P1" },
+  "affects_form_factors": ["desktop", "mobile"],
+  "form_factor_specific": false,         // only when both profiles ran
+  // ESLint / Semgrep findings, when changed_files was supplied:
+  "in_diff": true,
   // corroborated findings also carry:
   "confirmed_by": ["lighthouse", "pa11y"],
   "confidence": "high"
@@ -266,7 +435,7 @@ Each finding:
 ### `run_lighthouse`
 
 Returns `url`, `form_factor`, `scores` per category, `ttfb_ms`, and
-priority-ordered `findings`.
+priority-ordered `findings`, each with a stable [`id`](#finding-ids).
 
 #### Mobile vs desktop
 
@@ -300,7 +469,8 @@ is keyed by form factor, and each finding carries `affects_form_factors` and
 ### `run_accessibility_check`
 
 pa11y at WCAG 2 AA by default, violations only. Returns `url`, `standard`,
-`runners`, `violation_count`, `raw_violation_count`, `findings`.
+`runners`, `violation_count`, `raw_violation_count`, `findings`, each with a
+stable [`id`](#finding-ids).
 
 `raw_violation_count` versus `violation_count` shows the dedup at work: a rule
 failing on more than two elements collapses into one systemic finding carrying
@@ -397,15 +567,31 @@ release as hard as a certainty.
 
 ESLint and Semgrep in parallel against a local directory. Uses the project's own
 ESLint config when it finds one, otherwise a QA-focused baseline. Returns
-`path`, `tools_run`, `eslint_config_used`, `issue_count`, `findings`,
-`warnings`.
+`path`, `tools_run`, `eslint_config_used`, `semgrep_rulesets`, `issue_count`,
+`findings`, and optionally `diff_summary`, `eslint_packages`, `unavailable`
+and `warnings`. Every finding has an `id`; with `changed_files`, an `in_diff`.
+
+| Input | Default | Notes |
+|---|---|---|
+| `path` | — | Directory to scan. |
+| `ruleset` | per `language` | Semgrep ruleset(s): registry ids or local rule files/directories; string (comma-separated allowed) or array. Overrides `language`. |
+| `language` | — | `js` → `p/javascript`; `ts` → `p/javascript` + `p/typescript` (same as unset); `python` → `p/python`, and ESLint is skipped. |
+| `changed_files` | — | See [diff tagging](#diff-tagging-changed_files). |
+
+Registry rulesets are downloaded from semgrep.dev on every scan. Without
+network access Semgrep is reported in `unavailable` with `reason: "network"`;
+a local rules file works offline.
 
 
 ### `run_security_scan`
 
 Trivy over a local directory. Returns `path`, `tools_run`, `scanners`,
 `db_status`, `scores.security`, `issue_count`, `counts`, `findings`, and
-optionally `unfixable`, `licenses` and `warnings`.
+optionally `diff_summary`, `unfixable`, `licenses`, `unavailable` and
+`warnings`. Every finding has an [`id`](#finding-ids); with `changed_files`,
+an `in_diff` (vulnerabilities match on their lockfile or its manifest — see
+[diff tagging](#diff-tagging-changed_files)). Entries in `unfixable` are a
+decision queue rather than findings and carry neither.
 
 **Inputs**
 
@@ -415,6 +601,7 @@ optionally `unfixable`, `licenses` and `warnings`.
 | `scanners` | `["vuln","secret","misconfig"]` | Any of `vuln`, `secret`, `misconfig`, `license`. |
 | `min_severity` | all | `UNKNOWN`–`CRITICAL`. Rarely needed; see the caveat below. |
 | `skip_dirs` | — | Directories or globs to skip. |
+| `changed_files` | — | Paths relative to `path`. Tags findings `in_diff`; filters nothing. |
 
 **Why the defaults are what they are.** Trivy's own default for a filesystem
 scan is `vuln,secret` — infrastructure misconfiguration is off unless you ask,
@@ -705,9 +892,9 @@ output into a written report.
 
 | Priority | Meaning | Lighthouse | WCAG | ESLint / Semgrep | Trivy | CrUX field |
 |---|---|---|---|---|---|---|
-| P1 | Blocker — fix before shipping | Score < 50 | **Level A failure** — puts the target out of reach | Semgrep security, ESLint error | Committed secret; critical/high CVE, fix available, **direct** dependency | Core vital rated poor |
-| P2 | Warning — track before merging | 50–79 | **Level AA failure** | ESLint warning | Same severity but **transitive**; medium + direct; high/critical misconfiguration | Needs improvement, or any diagnostic |
-| P3 | Advisory — log as tech debt | 80–89 | **Above the target**, or a best-practice rule | — | Medium + transitive; low/unknown; other misconfiguration | — |
+| P1 | Blocker — fix before shipping | Score < 50 | **Level A failure** — puts the target out of reach | Semgrep security | Committed secret; critical/high CVE, fix available, **direct** dependency | Core vital rated poor |
+| P2 | Warning — track before merging | 50–79 | **Level AA failure** | ESLint error, Semgrep warning/error | Same severity but **transitive**; medium + direct; high/critical misconfiguration | Needs improvement, or any diagnostic |
+| P3 | Advisory — log as tech debt | 80–89 | **Above the target**, or a best-practice rule | ESLint warning | Medium + transitive; low/unknown; other misconfiguration | — |
 | *(suppressed)* | Passing — never reported | ≥ 90 | — | — | Passing checks; licences carry no priority | Good |
 
 Lighthouse findings are actually ranked by `weight × (1 − score)` — the category
@@ -730,6 +917,8 @@ Adjustments:
   finding is ranked on severity alone and tagged `relationship_unknown`.
 
 - **Corroborated** findings (two tools agreeing) are promoted one tier.
+- In `run_qa_gate`, findings seen **only on the non-primary form factor** are
+  demoted one tier — see [form factors in the gate](#form-factors-in-the-gate).
 - **Field-confirmed** findings are promoted one tier; **lab-only** findings
   contradicted by healthy field data are demoted and tagged `lab_only`.
 - **Non-core vitals** (FCP, TTFB) never exceed P2 — they explain a Core Web
@@ -764,7 +953,11 @@ Adjustments:
 │   │   ├── labFieldComparator.ts    # Lab vs field verdicts
 │   │   ├── psiAggregator.ts         # Cross-run arithmetic + redundancy rules
 │   │   ├── runComparator.ts         # Before/after diff: fixed, still failing, new
-│   │   └── wcagLevels.ts            # WCAG 2.1 criteria, levels, conformance rollup
+│   │   ├── wcagLevels.ts            # WCAG 2.1 criteria, levels, conformance rollup
+│   │   ├── findingId.ts             # Stable finding ids
+│   │   ├── diffTagger.ts            # changed_files → in_diff + diff_summary
+│   │   ├── formFactorMerge.ts       # Primary-profile merge and demotion
+│   │   └── releaseVerdict.ts        # Findings → BLOCKED/CONDITIONAL/ADVISORY/CLEAR
 │   └── utils/                       # Cross-tool helpers
 │       ├── shellRunner.ts           # Subprocess choke point
 │       ├── httpClient.ts            # HTTP choke point (retry, deadline, redaction)
@@ -779,8 +972,11 @@ Adjustments:
 │       ├── publicUrl.ts             # Reachability + session-gate checks
 │       ├── urlInput.ts              # One URL / list / CSV → URL array
 │       ├── batchState.ts            # Cursor, budget, index merge, gap-fill
+│       ├── staticRunner.ts          # ESLint + Semgrep, shared by gate and tool
+│       ├── unavailable.ts           # Missing-binary detection + install hints
 │       ├── eslintConfigDetector.ts
 │       └── toolResponse.ts
+├── test/                            # node:test unit tests + fixtures/ (npm test)
 ├── docs/
 │   ├── manual.md                    # This file
 │   └── psi-report-spec.md           # How to write the PSI audit report
@@ -858,8 +1054,11 @@ advisories that would have raised the recommended upgrade target.
 
 ### A tool shows `UNAVAILABLE`
 
-Its CLI is not on PATH. Install it (see
-[prerequisites](#prerequisites)) or ignore it — the rest of the gate still runs.
+Its CLI is not on PATH, or (Semgrep) its registry rulesets could not be
+downloaded. The `unavailable` array names the tool, the binary, the reason and
+the command to run. Install it (see [prerequisites](#prerequisites)), give
+Semgrep network access or a local `ruleset`, or ignore it — the rest of the
+gate still runs.
 
 ### A comparison reports nothing was compared
 
